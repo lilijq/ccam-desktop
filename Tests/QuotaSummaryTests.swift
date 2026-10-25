@@ -96,6 +96,66 @@ import Foundation
         check(summary([report("first", five: -20), report("second", five: 300)]).totalFiveHour == "1.00份", "pool arithmetic clamps stored percentages")
         check(summary([report("first", five: 99.8)]).totalFiveHour == "<0.01份", "small known total stays positive without rounding up")
         check(onlyModel.totalWeekly == "--", "model-scoped weekly cache is not the general pool weekly balance")
+
+        // Gauges expose unrounded arithmetic and explicit coverage; the UI must
+        // never treat an unknown account's rail segment as exhausted capacity.
+        func close(_ lhs: Double?, _ rhs: Double) -> Bool { lhs.map { abs($0 - rhs) < 1e-12 } ?? false }
+        check(none.currentGauge.remainingFraction == nil && none.totalGauge.remainingFraction == nil,
+              "no accounts have unknown gauges rather than empty balances")
+        check(none.currentGauge.knownFraction == 0 && none.totalGauge.knownFraction == 0 && !none.totalGauge.stale,
+              "no-account gauge has no known or stale readings")
+        check(summary([]).currentGauge.remainingFraction == nil && summary([]).totalGauge.remainingFraction == nil,
+              "accounts without cache have no fabricated gauge value")
+        check(regular.currentGauge.remainingFraction == 1 && regular.currentGauge.knownFraction == 1 && !regular.currentGauge.stale,
+              "current gauge preserves full five-hour allowance despite low weekly allowance")
+        check(close(regular.totalGauge.remainingFraction, 0.8) && regular.totalGauge.knownFraction == 1,
+              "pool gauge normalizes summed account fractions over all unique accounts")
+        check(regular.currentGauge.tooltip.contains("每周：剩余 2%") && regular.currentGauge.tooltip.contains("已用 0%"),
+              "current tooltip keeps used and remaining values with weekly separately visible")
+        check(regular.totalGauge.tooltip.contains("已知剩余 1.60份 / 2份") && regular.totalGauge.tooltip.contains("已知已用 0.40份"),
+              "pool tooltip reveals both unweighted totals and its full denominator")
+        check(regular.totalGauge.tooltip.contains("不表示 token") && regular.totalGauge.tooltip.contains("未按套餐加权"),
+              "pool gauge never implies a unified token or weighted plan capacity")
+        check(exhausted.currentGauge.remainingFraction == 0 && exhausted.currentGauge.knownFraction == 1,
+              "known exhausted current allowance is distinct from unknown")
+        check(close(exhausted.totalGauge.remainingFraction, 0.5), "another full account remains in the pool after current exhaustion")
+        check(partial.totalGauge.remainingFraction == 0 && partial.totalGauge.knownFraction == 0.5,
+              "partial exhausted cache leaves half the rail explicitly unknown")
+        check(partial.totalGauge.tooltip.contains("虚线为未知额度") && partial.totalGauge.tooltip.contains("覆盖 1/2"),
+              "partial gauge tooltip explains unknown coverage rather than zero balance")
+        check(independent.currentGauge.remainingFraction == 1 && close(independent.totalGauge.remainingFraction, 0.5)
+              && independent.totalGauge.knownFraction == 0.5,
+              "weekly-only account does not silently become known five-hour capacity")
+        check(close(selected.currentGauge.remainingFraction, 0.2) && close(selected.totalGauge.remainingFraction, 0.5),
+              "preferred active account changes current gauge only")
+        check(selectedUnknown.currentGauge.remainingFraction == nil && selectedUnknown.currentGauge.knownFraction == 0,
+              "preferred account without cache never borrows another account gauge")
+        check(close(deduped.totalGauge.remainingFraction, 0.6) && deduped.totalGauge.knownFraction == 1,
+              "same-identity profiles do not double the gauge denominator or remaining amount")
+        check(deduped.totalGauge.tooltip.contains("同邮箱账号仅计一份"), "pool gauge tooltip discloses conservative identity deduplication")
+        check(close(recent.currentGauge.remainingFraction, 0.2) && close(recent.totalGauge.remainingFraction, 0.1),
+              "gauge uses newest report once while retaining unknown second account in denominator")
+        check(old.currentGauge.stale && old.totalGauge.stale && old.currentGauge.remainingFraction == 1,
+              "old gauge retains measured balance with explicit stale state")
+        check(failed.currentGauge.stale && failed.totalGauge.stale && failed.currentGauge.tooltip.contains("上次读取未成功"),
+              "failed refresh cannot make cached gauge look live")
+        check(expired.totalGauge.stale && expired.totalGauge.tooltip.contains("不代表现在可执行"),
+              "expired gauge cannot imply executable account capacity")
+        check(passedReset.currentGauge.stale && passedReset.totalGauge.stale && close(passedReset.currentGauge.remainingFraction, 0.8),
+              "elapsed reset marks historical gauge stale without auto-refill")
+        check(bounds.currentGauge.remainingFraction == 1 && close(bounds.totalGauge.remainingFraction, 0.5),
+              "out-of-range gauge readings clamp without affecting unknown coverage")
+        check(summary([report("first", five: .nan)]).currentGauge.remainingFraction == nil
+              && summary([report("first", five: .infinity)]).totalGauge.knownFraction == 0,
+              "non-finite readings do not enter gauge arithmetic or coverage")
+        check(onlyModel.currentGauge.remainingFraction == nil && onlyModel.totalGauge.remainingFraction == nil,
+              "model-specific limits never impersonate general five-hour gauge")
+        check(close(summary([report("first", five: 99.8)]).currentGauge.remainingFraction, 0.002),
+              "tiny positive gauge preserves exact magnitude rather than formatted text rounding")
+        check(mixed.totalGauge.tooltip.contains("未按套餐加权") && close(mixed.totalGauge.remainingFraction, 0.5),
+              "mixed-plan gauge remains explicitly unweighted")
+        check(regular.currentGauge.tooltip.contains("不连接 Claude") && regular.totalGauge.tooltip.contains("不连接 Claude"),
+              "both gauge tooltips retain offline cache provenance")
         print("PASS: \(count) cached quota summary checks (fixtures only, no CLI or network requests)")
     }
 }

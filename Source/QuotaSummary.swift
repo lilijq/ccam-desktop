@@ -1,5 +1,15 @@
 import Foundation
 
+/// A read-only, five-hour gauge. Unknown capacity is the range from
+/// `knownFraction` to 1; it must not be drawn as used or exhausted capacity.
+/// Pool fractions are normalized per account, not weighted by plan size.
+struct QuotaGaugeSnapshot {
+    let remainingFraction: Double?
+    let knownFraction: Double
+    let stale: Bool
+    let tooltip: String
+}
+
 /// Offline quota arithmetic. A "份" is a fraction of one account's own full
 /// window, not a shared token balance or a capacity-weighted subscription total.
 struct QuotaSummary {
@@ -13,6 +23,8 @@ struct QuotaSummary {
     let totalWeekly: String
     let poolCoverage: String
     let cacheLabel: String
+    let currentGauge: QuotaGaugeSnapshot
+    let totalGauge: QuotaGaugeSnapshot
 
     static func make(accounts: [Account], usage: [AccountUsage], now: Date = Date(), preferredAccount: String? = nil) -> QuotaSummary {
         let offline = "仅显示本机缓存，不连接 Claude。实际可用量可能已变化。"
@@ -20,9 +32,12 @@ struct QuotaSummary {
         var seen = Set<String>()
         let accounts = accounts.filter { seen.insert($0.name).inserted }
         guard !accounts.isEmpty else {
+            let empty = QuotaGaugeSnapshot(remainingFraction: nil, knownFraction: 0, stale: false,
+                                          tooltip: "暂无账号\n" + offline)
             return QuotaSummary(title: "暂无账号", detail: "账号与额度", tooltip: offline,
                                 currentAccountName: nil, currentFiveHour: "--", currentWeekly: "--",
-                                totalFiveHour: "--", totalWeekly: "--", poolCoverage: "0 个账号", cacheLabel: "暂无缓存")
+                                totalFiveHour: "--", totalWeekly: "--", poolCoverage: "0 个账号", cacheLabel: "暂无缓存",
+                                currentGauge: empty, totalGauge: empty)
         }
         let names = Set(accounts.map(\.name))
         let reports = usage.filter { names.contains($0.name) }
@@ -103,9 +118,59 @@ struct QuotaSummary {
         if !oldReports.isEmpty { lines.append("合计包含 \(oldReports.count) 个账号的旧缓存；过期、读取失败或已过重置时间的数值不会自动补满。") }
         if knownReports.contains(where: \.needsLogin) { lines.append("合计包含需要重新登录的账号历史额度，不代表现在可执行。") }
         lines.append(offline)
+
+        func windowDescription(_ name: String, _ value: UsageWindow?) -> String {
+            guard let value else { return name + "：未知" }
+            return name + "：剩余 " + percentage(value.used) + "，已用 " + percentage(100 - value.used)
+        }
+        func dateDescription(_ date: Date) -> String {
+            DateFormatter.localizedString(from: date, dateStyle: .short, timeStyle: .short)
+        }
+        var currentLines = ["当前账号 " + current.name, windowDescription("5 小时", five), windowDescription("每周", week)]
+        if let report {
+            let stamp = report.measuredAt.flatMap(parseDate).map(dateDescription) ?? "时间未知"
+            currentLines.append((isOld(report, now: now) ? "旧缓存：" : "缓存：") + stamp)
+            if let reset = five?.reset.flatMap(parseDate) { currentLines.append("5 小时重置：" + dateDescription(reset)) }
+            if report.needsLogin { currentLines.append("需要重新登录；历史额度不代表现在可用。") }
+            else if report.status == "error" || report.error?.isEmpty == false { currentLines.append("上次读取未成功，保留此前数值。") }
+            if isOld(report, now: now), five != nil { currentLines.append("旧缓存不会因已过重置时间自动补满。") }
+        } else { currentLines.append("此账号暂无额度缓存。") }
+        currentLines.append(offline)
+        let currentGauge = QuotaGaugeSnapshot(remainingFraction: five.map { remaining($0.used) / 100 },
+                                              knownFraction: five == nil ? 0 : 1,
+                                              stale: five != nil && report.map { isOld($0, now: now) } == true,
+                                              tooltip: currentLines.joined(separator: "\n"))
+
+        // Keep all distinct accounts in the denominator. A partially known pool
+        // draws known remaining / known used / unknown as separate intervals.
+        let fiveReports = poolReports.filter { window($0, "5 小时额度") != nil }
+        let fiveDates = fiveReports.compactMap { $0.measuredAt.flatMap(parseDate) }
+        let totalStale = fiveReports.contains { isOld($0, now: now) }
+        let remainingTotal = fiveWindows.isEmpty ? nil : fiveWindows.reduce(0.0) { $0 + remaining($1.used) / 100 } / Double(count)
+        let usedTotal = fiveWindows.map { UsageWindow(label: $0.label, used: 100 - $0.used, reset: $0.reset) }
+        var totalLines = ["总剩余（5 小时）", "已知剩余 " + portions(fiveWindows) + " / \(count)份",
+                          "已知已用 " + portions(usedTotal) + "，覆盖 \(fiveWindows.count)/\(count) 个账号",
+                          "每周剩余 " + portions(weekWindows) + "，覆盖 \(weekWindows.count)/\(count) 个账号"]
+        if fiveReports.isEmpty { totalLines.append("暂无 5 小时额度缓存。") }
+        else {
+            let stamp = fiveDates.min().map(dateDescription) ?? "时间未知"
+            totalLines.append((totalStale ? "含旧缓存，已知最早记录：" : "缓存，已知最早记录：") + stamp)
+        }
+        if fiveWindows.count < count { totalLines.append("虚线为未知额度，不能当作 0；已知剩余按全部 \(count) 个账号满额归一化。") }
+        totalLines.append("1 份 = 一个账号自身的满额度；不表示 token、金额或统一容量，未按套餐加权。")
+        totalLines.append("5 小时和每周分开计算，各账号按自己的时间重置。")
+        if groups.count < accounts.count { totalLines.append("同邮箱账号仅计一份，采用最近缓存；不同组织的独立额度尚未确认。") }
+        if accounts.contains(where: { normalizedEmail($0) == nil }) { totalLines.append("部分账号未提供邮箱，身份去重尚未完全确认。") }
+        if totalStale { totalLines.append("旧缓存不会因已过重置时间自动补满。") }
+        if fiveReports.contains(where: \.needsLogin) { totalLines.append("包含需要重新登录的账号历史额度，不代表现在可执行。") }
+        totalLines.append(offline)
+        let totalGauge = QuotaGaugeSnapshot(remainingFraction: remainingTotal,
+                                            knownFraction: Double(fiveWindows.count) / Double(count), stale: totalStale,
+                                            tooltip: totalLines.joined(separator: "\n"))
         return QuotaSummary(title: title, detail: current.name + " · " + currentMarker, tooltip: lines.joined(separator: "\n"),
                             currentAccountName: current.name, currentFiveHour: currentFive, currentWeekly: currentWeek,
-                            totalFiveHour: portions(fiveWindows), totalWeekly: portions(weekWindows), poolCoverage: coverage, cacheLabel: cache)
+                            totalFiveHour: portions(fiveWindows), totalWeekly: portions(weekWindows), poolCoverage: coverage, cacheLabel: cache,
+                            currentGauge: currentGauge, totalGauge: totalGauge)
     }
 
     private static func remaining(_ used: Double) -> Double { max(0, min(100, 100 - used)) }

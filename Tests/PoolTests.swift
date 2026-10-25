@@ -14,6 +14,11 @@ final class TerminalSessionView {
     var output = ""
     var isWaiting = false
     var starts = 0
+    var chatReturnTarget: ChatTerminalTarget?
+    var chatReturnIdentityUncertain = false
+    var chatReturnPersistenceError: String?
+    func markReturnIdentityUncertain() { chatReturnIdentityUncertain = chatReturnTarget != nil }
+    func captureReturnIdentity(_ plan: PoolLaunch, rootPID: Int32) {}
     init(directory: String) {
         self.directory = directory
         session.onData = { [weak self] in self?.output += String(decoding: $0, as: UTF8.self) }
@@ -63,6 +68,8 @@ enum PoolTests {
             project = root.appendingPathComponent("project with spaces")
             try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
             env = CCAMClient.environment
+            for key in ExecutionProxy.proxyKeys + ["CCAM_DESKTOP_PROXY_SOURCE", "CCAM_DESKTOP_PROXY_ENDPOINT"] { env.removeValue(forKey: key) }
+            env["HTTP_PROXY"] = "http://127.0.0.1:1"
             env["CCAM_HOME"] = root.path; env["POOL_TEST_MODE"] = mode; env["POOL_TEST_NATIVE"] = ccam
             let fake = root.appendingPathComponent("fakeclaude.py")
             try Self.fake.write(to: fake, atomically: true, encoding: .utf8)

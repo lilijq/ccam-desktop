@@ -1,6 +1,30 @@
 import Foundation
 import Darwin
 
+struct ChatApprovalQuestion {
+    struct Option { let label: String; let description: String }
+    let question: String
+    let header: String
+    let options: [Option]
+    let multiSelect: Bool
+}
+
+/// A request from one running process, never a reusable permission rule.
+struct ChatApproval {
+    enum Kind { case tool, question, plan }
+    let id: String
+    let toolName: String
+    let inputDescription: String
+    let reason: String?
+    let kind: Kind
+    let questions: [ChatApprovalQuestion]
+    let canApprove: Bool
+    fileprivate let requestID: String
+    fileprivate let generation: Int
+    fileprivate let conversationID: String
+    fileprivate let input: [String: Any]
+}
+
 /// Incremental NDJSON decoding. Non-JSON launcher notices never become model
 /// events, permission approvals, or quota signals.
 struct ChatStreamDecoder {
@@ -38,11 +62,20 @@ final class ChatRuntime {
     private(set) var hasRunning = false
     private(set) var stateText = "可以开始新任务"
     private(set) var needsTerminalInteraction = false
+    private(set) var pendingApprovals: [ChatApproval] = []
     var beforeStart: (([String]) throws -> Void)?
     var onChange: (() -> Void)?
     var onMessage: ((ChatMessage) -> Void)?
     var onState: ((String) -> Void)?
     private var process: Process?
+    private var inputHandle: FileHandle?
+    private let inputQueue = DispatchQueue(label: "ccam.chat.stdin")
+    private var answeredApprovalIDs = Set<String>()
+    private var initializationID: String?
+    private var initializationTimer: Timer?
+    private var queuedPrompt: Data?
+    private var sessionState: String?
+    private var activeAgentTasks = Set<String>()
     private var plan: PoolLaunch?
     private var poll: Timer?
     private var retry: Timer?
@@ -59,6 +92,7 @@ final class ChatRuntime {
     private var lastAssistantID: String?
     private var receivedResult = false
     private var resultFailed = false
+    private var hadPermissionDenials = false
     private var identityMismatch = false
     private var identity: PoolChatIdentity?
     private var quota: PoolLimitEvent?
@@ -81,8 +115,9 @@ final class ChatRuntime {
     var terminalFallback: ChatTerminalTarget {
         ChatTerminalTarget(directory: project.path, sessionID: currentConversation?.sessionID,
                            account: currentConversation?.account, ticket: currentConversation?.ticket,
-                           canResume: currentConversation?.continuityUnavailable != true,
-                           model: currentOptions.model, permissionMode: currentOptions.permissionMode.rawValue, effort: currentOptions.effort)
+                           canResume: currentConversation?.continuityUnavailable != true && currentConversation?.terminalIdentityUncertain != true,
+                           model: currentOptions.model, permissionMode: currentOptions.permissionMode.rawValue, effort: currentOptions.effort,
+                           conversationID: currentConversation?.id)
     }
 
     init(project: ProjectRecord, store: ChatStore? = nil, ccamExecutable: String = CCAMClient.executable,
@@ -92,11 +127,12 @@ final class ChatRuntime {
         self.executable = ccamExecutable; self.helper = helperExecutable; self.environment = environment
         self.retryInterval = retryInterval; self.maximumWait = maximumWait
         conversations = self.store.conversations; selectedID = self.store.selectedID
-        if currentConversationTransferred { stateText = "已转到终端，此聊天记录为只读" }
+        if currentConversationTransferred { stateText = "终端中，可先写草稿" }
     }
 
     deinit {
-        poll?.invalidate(); retry?.invalidate(); saveTimer?.invalidate()
+        poll?.invalidate(); retry?.invalidate(); saveTimer?.invalidate(); initializationTimer?.invalidate()
+        try? inputHandle?.close()
         if let process, process.isRunning { process.terminate() }
         if let plan { GlobalPool.clean(plan) }
     }
@@ -112,7 +148,7 @@ final class ChatRuntime {
     func select(id: String) {
         guard !hasRunning, activeConversations.contains(where: { $0.id == id }) else { return }
         selectedID = id; needsTerminalInteraction = false
-        stateText = currentConversationTransferred ? "已转到终端，此聊天记录为只读" : "继续这段对话"
+        stateText = currentConversationTransferred ? "终端中，可先写草稿" : "继续这段对话"
         persist(); changed()
     }
 
@@ -192,44 +228,141 @@ final class ChatRuntime {
         try store.save(updated, selectedID: selectedID)
         if self.selectedID != store.selectedID && !hasRunning { needsTerminalInteraction = false }
         conversations = updated; self.selectedID = store.selectedID
-        if !hasRunning { stateText = currentConversationTransferred ? "已转到终端，此聊天记录为只读" : currentConversation == nil ? "可以开始新任务" : "继续这段对话" }
+        if !hasRunning { stateText = currentConversationTransferred ? "终端中，可先写草稿" : currentConversation == nil ? "可以开始新任务" : "继续这段对话" }
         changed()
     }
 
     func markTransferredToTerminal() {
         guard !hasRunning, let id = selectedID else { return }
         mutate(id) { $0.transferredToTerminal = true }
-        stateText = "已转到终端，此聊天记录为只读"; persist(); changed()
+        stateText = "终端中，可先写草稿"; persist(); changed()
     }
 
-    func send(text: String, permissionMode: ChatPermissionMode? = nil) {
+    /// `start` may throw only before it creates a terminal process. Persisting
+    /// ownership first prevents a live terminal and an editable chat from ever
+    /// owning the same native session after a failed metadata write.
+    func transferToTerminal(start: (ChatTerminalTarget) throws -> Void) throws {
+        guard !hasRunning, let conversation = currentConversation, !conversation.transferredToTerminal,
+              conversation.continuityUnavailable != true, conversation.terminalIdentityUncertain != true,
+              let index = conversations.firstIndex(where: { $0.id == conversation.id }) else {
+            throw AppError.message("当前对话不能转到终端，请先结束本轮并确认会话身份。")
+        }
+        let target = terminalFallback
+        let previous = conversations, selection = selectedID, previousState = stateText
+        let previousInteraction = needsTerminalInteraction
+        var updated = conversations
+        updated[index].transferredToTerminal = true; updated[index].updatedAt = Date()
+        // No terminal may be created unless this atomic commit succeeds.
+        try saveMetadata(updated, selectedID: selection)
+        do { try start(target) }
+        catch {
+            let startError = error
+            conversations = previous; selectedID = selection; needsTerminalInteraction = previousInteraction
+            do {
+                try store.save(previous, selectedID: selection)
+                state(previousState)
+            } catch {
+                state("终端未启动，原聊天已恢复；本地记录恢复失败，请检查保存位置。")
+                throw AppError.message(startError.localizedDescription + "；原聊天已恢复，但未能保存恢复记录。")
+            }
+            throw startError
+        }
+    }
+
+    /// Called by the terminal coordinator before changing accounts, then again
+    /// after its SessionStart hook supplies a verified identity. This survives
+    /// closing the terminal tab or restarting the desktop app.
+    func recordTerminalState(conversationID: String, account: String?, sessionID: String?, ticket: String?, uncertain: Bool) throws {
+        guard !(hasRunning && runConversationID == conversationID),
+              let index = conversations.firstIndex(where: { $0.id == conversationID && $0.deletedAt == nil }),
+              conversations[index].transferredToTerminal else {
+            throw AppError.message("这段对话已不在终端中，不能更新终端会话身份。")
+        }
+        var updated = conversations
+        if !uncertain {
+            guard let account, account.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil,
+                  let sessionID, UUID(uuidString: sessionID) != nil else {
+                throw AppError.message("终端会话身份不完整，未保存新的账号与会话。")
+            }
+            updated[index].account = account; updated[index].sessionID = sessionID; updated[index].ticket = ticket
+        }
+        updated[index].terminalIdentityUncertain = uncertain
+        updated[index].updatedAt = Date()
+        try saveMetadata(updated, selectedID: selectedID)
+    }
+
+    /// The workspace calls this only after the associated terminal has exited.
+    /// Supplied identity must come from that terminal's verified SessionStart.
+    func restoreFromTerminal(conversationID: String, account: String? = nil, sessionID: String? = nil, ticket: String? = nil) throws {
+        guard !hasRunning else { throw AppError.message("请先停止当前聊天，再从终端返回。") }
+        guard let index = conversations.firstIndex(where: { $0.id == conversationID && $0.deletedAt == nil }),
+              conversations[index].transferredToTerminal, conversations[index].continuityUnavailable != true,
+              conversations[index].terminalIdentityUncertain != true else {
+            throw AppError.message("这段对话不能安全返回，请检查原会话身份。")
+        }
+        guard (account == nil) == (sessionID == nil) else { throw AppError.message("终端会话身份不完整。") }
+        let restoredAccount = account ?? conversations[index].account
+        let restoredSession = sessionID ?? conversations[index].sessionID
+        guard let restoredAccount, restoredAccount.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil,
+              let restoredSession, UUID(uuidString: restoredSession) != nil else { throw AppError.message("未能验证终端会话，不能猜测账号或最近对话。") }
+        var updated = conversations
+        updated[index].account = restoredAccount; updated[index].sessionID = restoredSession
+        if account != nil { updated[index].ticket = ticket }
+        updated[index].transferredToTerminal = false; updated[index].terminalIdentityUncertain = nil; updated[index].updatedAt = Date()
+        try saveMetadata(updated, selectedID: selectedID)
+        needsTerminalInteraction = false
+        if selectedID == conversationID { state("已返回聊天，可以继续原任务") }
+    }
+
+    @discardableResult
+    func send(text: String, permissionMode: ChatPermissionMode? = nil) -> Bool {
         let attachments = currentAttachments
-        guard !hasRunning, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else { return }
+        guard !hasRunning, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else { return false }
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "请查看附件。" : text
-        if selectedID == nil { createConversation() }
-        guard let conversation = currentConversation else { return }
-        guard !conversation.transferredToTerminal else { state("已转到终端，请在终端继续或新建对话"); return }
-        guard conversation.continuityUnavailable != true else { state("无法验证原会话身份，请新建对话；不会猜测最近会话"); return }
-        guard project.directoryExists else { state("项目文件夹不存在"); return }
-        guard conversation.sessionID == nil || conversation.account != nil else { state("原会话的账号身份未确认，不能安全继续"); return }
+        let previousConversations = conversations, previousSelection = selectedID
+        let conversation = currentConversation ?? ChatConversation(id: UUID().uuidString, title: "新对话", projectID: project.id.uuidString, directory: project.path)
+        guard !conversation.transferredToTerminal else { state("请先从终端返回聊天，再继续原任务"); return false }
+        guard conversation.continuityUnavailable != true, conversation.terminalIdentityUncertain != true else { state("无法验证原会话身份，请新建对话；不会猜测最近会话"); return false }
+        guard project.directoryExists else { state("项目文件夹不存在"); return false }
+        guard conversation.sessionID == nil || conversation.account != nil else { state("原会话的账号身份未确认，不能安全继续"); return false }
         var options = currentOptions
         if let permissionMode { options.permissionMode = permissionMode }
         do {
+            _ = try ExecutionProxy.resolve(environment: environment)
             options.model = try GlobalPool.validatedChatModel(options.model)
             options.effort = try GlobalPool.validatedChatEffort(options.effort)
-            initialInput = attachments.isEmpty ? nil : try attachmentInput(text: text, attachments: attachments)
+            initialInput = try attachmentInput(text: text, attachments: attachments)
         }
-        catch { state(error.localizedDescription); return }
+        catch { state(error.localizedDescription); return false }
+        var updated = conversations
+        if !updated.contains(where: { $0.id == conversation.id }) { updated.insert(conversation, at: 0) }
+        let index = updated.firstIndex { $0.id == conversation.id }!
+        updated[index].options = options
+        if updated[index].messages.isEmpty && updated[index].title == "新对话" { updated[index].title = String(text.split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(48) ?? "新对话".prefix(48)) }
+        updated[index].messages.append(ChatMessage(role: "user", text: text, attachments: attachments.isEmpty ? nil : attachments))
+        updated[index].draftAttachments = nil; updated[index].updatedAt = Date()
+        conversations = updated; selectedID = conversation.id
         runConversationID = conversation.id; runOptions = options; runAttachments = attachments; needsTerminalInteraction = false
         attemptedQuotaTickets.removeAll(); waitingSince = nil; generation += 1; hasRunning = true
-        mutate(conversation.id) { item in
-            item.options = options
-            if item.messages.isEmpty && item.title == "新对话" { item.title = String(text.split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(48) ?? "新对话".prefix(48)) }
-            item.messages.append(ChatMessage(role: "user", text: text, attachments: attachments.isEmpty ? nil : attachments))
-            item.draftAttachments = nil
+        changed()
+        var metadataCommitted = false
+        let started = launch(prompt: text, ticket: conversation.ticket, automatic: false, generation: generation) {
+            do { try self.store.save(updated, selectedID: conversation.id); metadataCommitted = true }
+            catch { throw AppError.message("聊天记录保存失败，任务未启动；输入与附件已保留：" + error.localizedDescription) }
         }
-        persist(); changed()
-        launch(prompt: text, ticket: conversation.ticket, automatic: false, generation: generation)
+        if started { return true }
+        // No child was started: undo the optimistic send, including attachment
+        // ownership and generated title. A real started turn is never rolled back.
+        let failure = stateText
+        conversations = previousConversations; selectedID = previousSelection
+        runConversationID = nil; initialInput = nil; runAttachments = []; hasRunning = false
+        do {
+            if metadataCommitted { try store.save(previousConversations, selectedID: previousSelection) }
+            state(failure)
+        }
+        catch { state(failure + "；草稿记录恢复失败，输入与附件仍保留，请检查保存位置。") }
+        changed()
+        return false
     }
 
     func stop() {
@@ -237,6 +370,7 @@ final class ChatRuntime {
         captureIdentity()
         let previous = generation
         generation += 1; retry?.invalidate(); retry = nil; poll?.invalidate(); poll = nil
+        clearControlState()
         waitingSince = nil
         if let process {
             stoppingGeneration = previous
@@ -248,8 +382,139 @@ final class ChatRuntime {
         state("已停止，已保存这段对话"); persist()
     }
 
-    private func launch(prompt: String, ticket: String?, automatic: Bool, generation expected: Int) {
-        guard generation == expected, hasRunning, let id = runConversationID, let conversation = conversations.first(where: { $0.id == id }) else { return }
+    func approve(id: String) throws {
+        let approval = try activeApproval(id)
+        guard approval.kind != .question else { throw AppError.message("请先回答问题，再继续。") }
+        guard approval.canApprove else { throw AppError.message("请求内容不完整，请拒绝并让 Claude 补充后重试。") }
+        try respond(to: approval, result: ["behavior": "allow", "updatedInput": approval.input])
+    }
+
+    func deny(id: String, message: String = "用户拒绝了此操作。") throws {
+        let approval = try activeApproval(id)
+        let explanation = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        try respond(to: approval, result: ["behavior": "deny", "message": explanation.isEmpty ? "用户拒绝了此操作。" : String(explanation.prefix(4_000))])
+    }
+
+    func answer(id: String, answers: [String: String]) throws {
+        let approval = try activeApproval(id)
+        guard approval.kind == .question, approval.canApprove,
+              Set(answers.keys) == Set(approval.questions.map(\.question)),
+              answers.values.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 4_000 }) else {
+            throw AppError.message("请回答每个问题后再提交。")
+        }
+        var updatedInput = approval.input; updatedInput["answers"] = answers
+        try respond(to: approval, result: ["behavior": "allow", "updatedInput": updatedInput])
+    }
+
+    private func activeApproval(_ id: String) throws -> ChatApproval {
+        guard let approval = pendingApprovals.first(where: { $0.id == id }), hasRunning, stoppingGeneration == nil,
+              approval.generation == generation, approval.conversationID == runConversationID,
+              process?.isRunning == true, inputHandle != nil, !answeredApprovalIDs.contains(approval.requestID) else {
+            throw AppError.message("这个确认已失效，请使用当前对话中的请求。")
+        }
+        captureIdentity()
+        guard identity != nil, !identityMismatch else { throw AppError.message("会话身份尚未验证，暂不能发送确认。") }
+        return approval
+    }
+
+    private func respond(to approval: ChatApproval, result: [String: Any]) throws {
+        // No updatedPermissions: a click authorizes only this pending call.
+        let frame: [String: Any] = ["type": "control_response", "response": ["subtype": "success", "request_id": approval.requestID, "response": result]]
+        try writeFrame(frame, generation: approval.generation)
+        answeredApprovalIDs.insert(approval.requestID)
+        pendingApprovals.removeAll { $0.id == approval.id }
+        state(pendingApprovals.isEmpty ? "正在处理" : "等待你的确认")
+    }
+
+    private func receiveApproval(_ event: [String: Any]) {
+        guard let requestID = event["request_id"] as? String, !requestID.isEmpty, requestID.count <= 512,
+              let request = event["request"] as? [String: Any] else { failControl("收到无法识别的确认请求，已停止本轮。"); return }
+        guard !answeredApprovalIDs.contains(requestID) else { return }
+        guard request["subtype"] as? String == "can_use_tool", let toolName = request["tool_name"] as? String,
+              !toolName.isEmpty, toolName.count <= 256, let input = request["input"] as? [String: Any],
+              let conversationID = runConversationID,
+              let encoded = try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]), encoded.count <= 1_048_576 else {
+            try? writeFrame(["type": "control_response", "response": ["subtype": "error", "request_id": requestID, "error": "CCAM cannot handle this control request."]], generation: generation)
+            answeredApprovalIDs.insert(requestID)
+            append(role: "notice", text: "收到不支持的交互请求，已返回失败；没有批准执行。")
+            return
+        }
+        if let existing = pendingApprovals.first(where: { $0.requestID == requestID }) {
+            if existing.toolName != toolName || !NSDictionary(dictionary: existing.input).isEqual(to: input) {
+                failControl("确认内容发生变化，已停止本轮，请重新发起。")
+            }
+            return
+        }
+        let kind: ChatApproval.Kind = toolName == "AskUserQuestion" ? .question : toolName == "ExitPlanMode" ? .plan : .tool
+        let rawQuestions = input["questions"] as? [[String: Any]] ?? []
+        let questions = rawQuestions.compactMap { row -> ChatApprovalQuestion? in
+            guard let text = row["question"] as? String, !text.isEmpty, text.count <= 8_000,
+                  let options = row["options"] as? [[String: Any]], options.count <= 8 else { return nil }
+            let choices = options.compactMap { option -> ChatApprovalQuestion.Option? in
+                guard let label = option["label"] as? String, !label.isEmpty else { return nil }
+                return .init(label: label, description: option["description"] as? String ?? "")
+            }
+            guard choices.count == options.count else { return nil }
+            return .init(question: text, header: row["header"] as? String ?? "问题", options: choices, multiSelect: row["multiSelect"] as? Bool == true)
+        }
+        let planText = (input["plan"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let complete = kind == .question ? !questions.isEmpty && questions.count <= 4 && questions.count == rawQuestions.count && Set(questions.map(\.question)).count == questions.count
+            : kind == .plan ? !planText.isEmpty : true
+        var reason = request["decision_reason"] as? String
+        if let path = request["blocked_path"] as? String, !path.isEmpty { reason = (reason.map { $0 + "\n" } ?? "") + path }
+        if !complete { reason = kind == .plan ? "未收到可审阅的计划内容，请拒绝并要求补充计划。" : "问题内容不完整，请拒绝并要求重新提问。" }
+        pendingApprovals.append(ChatApproval(id: UUID().uuidString, toolName: toolName,
+                                            inputDescription: kind == .plan && complete ? planText : String(decoding: encoded, as: UTF8.self),
+                                            reason: reason, kind: kind, questions: questions, canApprove: complete,
+                                            requestID: requestID, generation: generation, conversationID: conversationID, input: input))
+        state(kind == .question ? "等待你的回答" : "等待你的确认")
+    }
+
+    private func writeFrame(_ frame: [String: Any], generation expected: Int) throws {
+        var bytes = try JSONSerialization.data(withJSONObject: frame); bytes.append(10)
+        try writeInput(bytes, generation: expected)
+    }
+
+    private func writeInput(_ data: Data, generation expected: Int) throws {
+        guard generation == expected, hasRunning, let handle = inputHandle else { throw AppError.message("对话输入通道已关闭。") }
+        inputQueue.async { [weak self] in
+            do { try handle.write(contentsOf: data) }
+            catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == expected, self.hasRunning else { return }
+                    self.failControl("未能把输入送入当前会话，已停止本轮；原对话已保留。")
+                }
+            }
+        }
+    }
+
+    private func closeInput() {
+        guard let handle = inputHandle else { return }
+        inputHandle = nil
+        inputQueue.async { try? handle.close() }
+    }
+
+    private func clearControlState() {
+        initializationTimer?.invalidate(); initializationTimer = nil; initializationID = nil; queuedPrompt = nil
+        pendingApprovals.removeAll(); answeredApprovalIDs.removeAll(); activeAgentTasks.removeAll(); sessionState = nil
+        closeInput()
+    }
+
+    private func failControl(_ message: String) {
+        resultFailed = true; append(role: "error", text: message); clearControlState()
+        if let process, process.isRunning { terminate(process) }
+        state("本轮未完成")
+    }
+
+    private func closeInputIfFinished() {
+        guard receivedResult, pendingApprovals.isEmpty, activeAgentTasks.isEmpty,
+              sessionState == nil || sessionState == "idle" else { return }
+        closeInput()
+    }
+
+    @discardableResult
+    private func launch(prompt: String, ticket: String?, automatic: Bool, generation expected: Int, beforeSpawn: (() throws -> Void)? = nil) -> Bool {
+        guard generation == expected, hasRunning, let id = runConversationID, let conversation = conversations.first(where: { $0.id == id }) else { return false }
         do {
             let base = try GlobalPool.prepareChat(directory: project.path, account: conversation.account, sessionID: conversation.sessionID,
                                                        newSessionID: conversation.sessionID == nil ? UUID().uuidString : nil, ticket: ticket,
@@ -275,19 +540,20 @@ final class ChatRuntime {
             if !unavailable.isEmpty {
                 append(role: "notice", text: "历史附件已变更或丢失：" + unavailable.prefix(3).joined(separator: "、") + "。重新添加后可继续引用，对话仍可继续。")
             }
-            let structured = !automatic && !runAttachments.isEmpty
-            if structured { extra += ["--input-format", "stream-json"] }
             if !directories.isEmpty { extra += ["--add-dir"] + directories.sorted() }
             let prepared = PoolLaunch(args: base.args + extra, environment: base.environment, eventDirectory: base.eventDirectory,
                                       token: base.token, directory: base.directory, createdAt: base.createdAt, ticket: base.ticket,
                                       automaticallyContinuesTask: base.automaticallyContinuesTask, helperExecutable: base.helperExecutable)
-            let inputData = structured ? (initialInput ?? Data(prompt.utf8)) : Data(prompt.utf8)
+            let inputData: Data
+            if !automatic, let initialInput { inputData = initialInput }
+            else { inputData = try attachmentInput(text: prompt, attachments: []) }
             do { try beforeStart?(prepared.args) } catch { GlobalPool.clean(prepared); throw error }
-            guard generation == expected, hasRunning else { GlobalPool.clean(prepared); return }
+            guard generation == expected, hasRunning else { GlobalPool.clean(prepared); return false }
+            clearControlState()
             plan = prepared; identity = nil; quota = nil; recovery = automatic
             effectivePermissionMode = nil
             decoder = ChatStreamDecoder(); streamMessageID = nil; streamSessionID = nil; streamTextIndex = 0; assistantIDs.removeAll(); finalizedAssistantKeys.removeAll(); toolIDs.removeAll(); lastAssistantID = nil
-            receivedResult = false; resultFailed = false; identityMismatch = false
+            receivedResult = false; resultFailed = false; hadPermissionDenials = false; identityMismatch = false
             let child = Process(); child.executableURL = URL(fileURLWithPath: executable); child.arguments = prepared.args
             child.currentDirectoryURL = URL(fileURLWithPath: project.path); child.environment = prepared.environment
             let input = Pipe(), output = Pipe(), errors = Pipe()
@@ -295,11 +561,17 @@ final class ChatRuntime {
             // Treat that as an I/O error instead of terminating the desktop app.
             _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
             child.standardInput = input; child.standardOutput = output; child.standardError = errors
-            try child.run(); process = child
-            state(automatic ? "已切换账号，正在接续未完成任务" : "正在处理")
+            // Commit only after all preflight work succeeds, but before a real
+            // process can act on this prompt. Persistence failure cannot start it.
+            try beforeSpawn?()
+            try child.run(); process = child; inputHandle = input.fileHandleForWriting
+            state(automatic ? "已切换账号，正在接续未完成任务" : "正在连接会话")
             poll = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.readHooks(expected) }
-            DispatchQueue.global(qos: .userInitiated).async {
-                try? input.fileHandleForWriting.write(contentsOf: inputData); try? input.fileHandleForWriting.close()
+            let initialize = "ccam-init-" + UUID().uuidString
+            initializationID = initialize; queuedPrompt = inputData
+            initializationTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: false) { [weak self] _ in
+                guard let self, self.generation == expected, self.initializationID == initialize else { return }
+                self.failControl("会话初始化超时，已停止本轮，请检查代理与 Claude Code 安装。")
             }
             let drained = DispatchGroup(); drained.enter()
             DispatchQueue.global(qos: .utility).async {
@@ -307,17 +579,29 @@ final class ChatRuntime {
                 try? errors.fileHandleForReading.close(); drained.leave()
             }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                while let bytes = try? output.fileHandleForReading.read(upToCount: 65_536), !bytes.isEmpty {
+                // read(upToCount:) can wait to fill its buffer on Darwin pipes.
+                // availableData returns each available chunk, including a small
+                // permission request whose producer is waiting for our answer.
+                while true {
+                    let bytes = output.fileHandleForReading.availableData
+                    if bytes.isEmpty { break }
                     DispatchQueue.main.async { [weak self] in self?.consume(bytes, expected) }
                 }
                 try? output.fileHandleForReading.close(); child.waitUntilExit(); drained.wait()
                 let code = child.terminationStatus
                 DispatchQueue.main.async { [weak self] in self?.finished(code, expected) }
             }
+            do {
+                try writeFrame(["type": "control_request", "request_id": initialize,
+                                "request": ["subtype": "initialize", "hooks": NSNull()]], generation: expected)
+            } catch { failControl("会话已启动，但输入通道无法初始化；已停止本轮，原消息已保留。") }
+            return true
         } catch {
+            clearControlState()
             if let plan { GlobalPool.clean(plan); self.plan = nil }
-            append(role: "error", text: error.localizedDescription)
-            hasRunning = false; state("未能开始，请检查项目、账号与设置"); persist()
+            hasRunning = false; state("未能开始：" + error.localizedDescription)
+            if automatic { append(role: "error", text: error.localizedDescription); persist() }
+            return false
         }
     }
 
@@ -356,10 +640,22 @@ final class ChatRuntime {
     private func handle(_ event: [String: Any]) {
         let type = event["type"] as? String ?? ""
         if let session = event["session_id"] as? String, let identity, session != identity.sessionID {
-            resultFailed = true; identityMismatch = true; return // A stream from another session is never joined.
+            identityMismatch = true
+            failControl("会话身份不匹配，已停止本轮；不会把确认发送到其他会话。")
+            return // A stream from another session is never joined.
         }
         switch type {
         case "system":
+            if event["subtype"] as? String == "session_state_changed" {
+                sessionState = event["state"] as? String
+                closeInputIfFinished()
+            }
+            if event["subtype"] as? String == "task_started", let task = event["task_id"] as? String,
+               ["local_agent", "local_workflow"].contains(event["task_type"] as? String ?? "") { activeAgentTasks.insert(task) }
+            if ["task_notification", "task_updated"].contains(event["subtype"] as? String ?? ""), let task = event["task_id"] as? String {
+                let status = event["status"] as? String ?? (event["patch"] as? [String: Any])?["status"] as? String ?? ""
+                if event["subtype"] as? String == "task_notification" || ["completed", "failed", "stopped"].contains(status) { activeAgentTasks.remove(task) }
+            }
             if event["subtype"] as? String == "init", let sid = event["session_id"] as? String, UUID(uuidString: sid) != nil { streamSessionID = sid }
             if ["init", "status"].contains(event["subtype"] as? String ?? ""),
                let effective = event["permissionMode"] as? String, effective != effectivePermissionMode {
@@ -373,6 +669,7 @@ final class ChatRuntime {
                 }
             }
         case "stream_event":
+            receivedResult = false
             guard let inner = event["event"] as? [String: Any] else { return }
             let kind = inner["type"] as? String
             if kind == "message_start", let message = inner["message"] as? [String: Any] { streamMessageID = message["id"] as? String }
@@ -382,6 +679,7 @@ final class ChatRuntime {
             }
             if kind == "content_block_start", let block = inner["content_block"] as? [String: Any], block["type"] as? String == "tool_use" { tool(block) }
         case "assistant":
+            receivedResult = false
             guard let message = event["message"] as? [String: Any] else { return }
             let content = message["content"] as? [[String: Any]] ?? []
             for text in content.filter({ $0["type"] as? String == "text" }).compactMap({ $0["text"] as? String }) where !text.isEmpty {
@@ -403,14 +701,30 @@ final class ChatRuntime {
         case "result":
             receivedResult = true; resultFailed = resultFailed || event["is_error"] as? Bool == true
             if let denials = event["permission_denials"] as? [Any], !denials.isEmpty {
-                needsTerminalInteraction = true
-                append(role: "notice", text: "有操作需要权限确认。可在终端继续同一会话；这里不会自动放行。")
+                hadPermissionDenials = true
+                append(role: "notice", text: "部分操作被当前权限规则拒绝，可说明下一步要求后继续；需要确认的请求会在聊天中显示。")
             }
             if lastAssistantID == nil, let text = event["result"] as? String, !text.isEmpty { assistant(text, key: "result", replace: true) }
+            closeInputIfFinished()
+        case "control_response":
+            guard let response = event["response"] as? [String: Any], let initialize = initializationID,
+                  response["request_id"] as? String == initialize else { return }
+            initializationTimer?.invalidate(); initializationTimer = nil; initializationID = nil
+            guard response["subtype"] as? String == "success", let prompt = queuedPrompt else {
+                failControl("Claude Code 无法建立交互通道，已停止本轮。"); return
+            }
+            queuedPrompt = nil
+            do { try writeInput(prompt, generation: generation); state("正在处理") }
+            catch { failControl("会话输入通道已关闭，已停止本轮。") }
         case "control_request":
-            needsTerminalInteraction = true; resultFailed = true
-            append(role: "notice", text: "此会话需要交互式确认，请在终端继续。")
-            if let process, process.isRunning { terminate(process) }
+            receiveApproval(event)
+        case "control_cancel_request":
+            if let requestID = event["request_id"] as? String {
+                answeredApprovalIDs.insert(requestID)
+                pendingApprovals.removeAll { $0.requestID == requestID }
+                state(pendingApprovals.isEmpty ? "正在处理" : "等待你的确认")
+                closeInputIfFinished()
+            }
         default: break
         }
     }
@@ -429,6 +743,7 @@ final class ChatRuntime {
     private func finished(_ code: Int32, _ expected: Int) {
         defer { if !hasRunning { initialInput = nil; runAttachments = [] } }
         if stoppingGeneration == expected {
+            clearControlState()
             captureIdentity()
             if (identity == nil || identityMismatch), let id = runConversationID {
                 mutate(id) { $0.continuityUnavailable = true }
@@ -440,6 +755,7 @@ final class ChatRuntime {
         guard generation == expected, hasRunning else { return }
         for event in decoder.append(Data(), finish: true) { handle(event) }
         readHooks(expected); poll?.invalidate(); poll = nil
+        clearControlState()
         let oldPlan = plan; plan = nil; process = nil
         if let oldPlan { GlobalPool.clean(oldPlan) }
         if let event = quota, !identityMismatch {
@@ -464,7 +780,7 @@ final class ChatRuntime {
         }
         hasRunning = false; waitingSince = nil
         if needsTerminalInteraction { state("需要权限确认，可在终端继续") }
-        else if code == 0 && receivedResult && !resultFailed { state("已完成，可以继续提问") }
+        else if code == 0 && receivedResult && !resultFailed { state(hadPermissionDenials ? "本轮结束，部分操作未获授权" : "已完成，可以继续提问") }
         else {
             append(role: "error", text: code == 75 ? "全局账号池暂无已登录且额度可用的账号。" : "本轮未完成，原对话已保留。网络、登录或其他错误不会自动换号。")
             state("本轮未完成")

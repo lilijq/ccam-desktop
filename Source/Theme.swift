@@ -32,6 +32,7 @@ enum Theme {
     static let border = adaptive(0xD8D8D8, 0x303030)
     static let success = adaptive(0x287159, 0x82D7B4)
     static let warning = adaptive(0x9A5A08, 0xF0BB71)
+    static let danger = adaptive(0xB1433E, 0xEF8B85)
     static let button = adaptive(0xEAEAEA, 0x272727)
     static let disabledButton = adaptive(0xEFEFEF, 0x242424)
     static var mode: AppearanceMode { .from(UserDefaults.standard.string(forKey: AppearanceMode.preferenceKey) ?? AppearanceMode.dark.rawValue) }

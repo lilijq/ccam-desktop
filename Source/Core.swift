@@ -128,17 +128,13 @@ final class CCAMClient {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = args
-            // Quota probes have a known HTTPS destination and do not run project tools.
-            // macOS GUI launches do not inherit the user's shell proxy variables.
-            process.environment = args.first == "usage"
-                ? NetworkEnvironment.applyingSystemProxy(to: environment, destination: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-                : environment
             process.currentDirectoryURL = URL(fileURLWithPath: directory)
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = pipe
             process.standardInput = FileHandle.nullDevice
             do {
+                process.environment = try executionEnvironment(arguments: args)
                 try process.run()
                 let watchdog = DispatchWorkItem {
                     if process.isRunning { process.terminate() }
@@ -154,6 +150,13 @@ final class CCAMClient {
                 DispatchQueue.main.async { completion(CommandResult(code: -1, output: error.localizedDescription)) }
             }
         }
+    }
+
+    /// Local inventory/cache commands stay available offline. Every other command
+    /// must resolve the current required proxy before a process can be launched.
+    static func executionEnvironment(arguments: [String]) throws -> [String: String] {
+        ExecutionProxy.requiresProxy(arguments: arguments)
+            ? try ExecutionProxy.resolve(environment: environment).environment : environment
     }
 }
 

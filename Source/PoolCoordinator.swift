@@ -67,6 +67,7 @@ final class PoolCoordinator {
 
     private func tick() {
         guard !cancelled, let view else { return }
+        view.captureReturnIdentity(plan, rootPID: rootPID)
         if event == nil && view.session.running, let candidate = GlobalPool.readEvent(plan) {
             if let interrupted = lastInterruptAt, interrupted >= (candidate.limitAt ?? candidate.at) {
                 try? FileManager.default.removeItem(at: plan.eventURL)
@@ -137,6 +138,7 @@ final class PoolCoordinator {
     }
 
     func exited(_ code: Int32) {
+        view?.captureReturnIdentity(plan, rootPID: rootPID)
         guard !cancelled else { return }
         if pending != nil { replace(); return }
         if code == 75 && event == nil, let ticket = plan.ticket, FileManager.default.fileExists(atPath: ticket) {
@@ -160,6 +162,12 @@ final class PoolCoordinator {
     private func replace() {
         guard !cancelled, let replacement = pending, let view, !view.session.running else { return }
         pending = nil
+        view.markReturnIdentityUncertain()
+        if view.chatReturnPersistenceError != nil {
+            GlobalPool.clean(replacement)
+            notice("无法保存接续位置，已暂停换号。请检查本地数据目录。", state: .failed)
+            cancel(user: false); return
+        }
         GlobalPool.clean(plan); plan = replacement
         event = nil; waitingSince = nil; nextAttempt = .distantFuture; lastNotice = ""
         lastInterruptAt = nil
@@ -186,6 +194,7 @@ final class PoolCoordinator {
     }
 
     func cancel(user: Bool) {
+        view?.captureReturnIdentity(plan, rootPID: rootPID)
         if user { onStateChanged?(.paused, "已停止自动续做，项目文件与对话记录已保留。") }
         cancelled = true; generation += 1; checking = false
         timer?.invalidate(); timer = nil; view?.setWaiting(false)

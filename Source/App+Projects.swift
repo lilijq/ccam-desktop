@@ -170,7 +170,7 @@ extension AppDelegate {
         do { try launchProjectTask(record, continueLast: true, initialPrompt: nil) }
         catch { showError(OperationPresentation.clean(error.localizedDescription), window: window) }
     }
-    func showProjectWorkspace(_ record: ProjectRecord, section: ProjectWorkspace.Section = .chat, newConversation: Bool = false) {
+    func showProjectWorkspace(_ record: ProjectRecord, section: ProjectWorkspace.Section? = nil, newConversation: Bool = false) {
         do { try projectStore?.select(id: record.id) }
         catch { showError(error.localizedDescription, window: window); return }
         terminalWorkspace.filter(projectID: record.id.uuidString)

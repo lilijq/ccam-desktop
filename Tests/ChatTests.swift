@@ -12,6 +12,10 @@ import UniformTypeIdentifiers
         let end = Date().addingTimeInterval(seconds)
         while Date() < end && !until() { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
     }
+    static func sameSavedMetadata(_ lhs: [ChatConversation], _ rhs: [ChatConversation]) -> Bool {
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(lhs)) == (try? encoder.encode(rhs))
+    }
     static func imageData() -> Data {
         let context = CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
         context.setFillColor(CGColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 1)); context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
@@ -34,6 +38,8 @@ import UniformTypeIdentifiers
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             project = ProjectRecord(id: UUID(), name: "Fixture", path: directory.path, createdAt: Date(), lastOpenedAt: Date(), archived: false)
             var env = CCAMClient.environment; env["CCAM_HOME"] = root.path; env["CHAT_FIXTURE_MODE"] = mode; env["CHAT_NATIVE"] = native
+            for key in ExecutionProxy.proxyKeys + ["CCAM_DESKTOP_PROXY_SOURCE", "CCAM_DESKTOP_PROXY_ENDPOINT"] { env.removeValue(forKey: key) }
+            env["HTTP_PROXY"] = "http://127.0.0.1:1"
             environment = env
             let fake = root.appendingPathComponent("fakeclaude.py")
             try Self.fake.write(to: fake, atomically: true, encoding: .utf8); try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
@@ -60,6 +66,9 @@ import UniformTypeIdentifiers
             ((try? String(contentsOf: root.appendingPathComponent("runs"), encoding: .utf8)) ?? "").split(separator: "\n").compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
         }
         var work: [String] { ((try? Data(contentsOf: URL(fileURLWithPath: project.path).appendingPathComponent("work-state.json"))).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String] }) ?? [] }
+        var replies: [[String: Any]] {
+            ((try? String(contentsOf: root.appendingPathComponent("replies"), encoding: .utf8)) ?? "").split(separator: "\n").compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+        }
         func send(_ prompt: String, mode: ChatPermissionMode? = nil) { runtime.send(text: prompt, permissionMode: mode); spin { !self.runtime.hasRunning } }
         func clean() { runtime.stop(); spin(3) { !self.runtime.hasRunning }; try? FileManager.default.removeItem(at: root) }
         deinit { clean() }
@@ -74,7 +83,10 @@ os.execv(os.environ['CHAT_NATIVE'],[os.environ['CHAT_NATIVE']]+args)
         static let fake = #"""
 #!/usr/bin/python3
 import os,sys,json,pathlib,uuid,datetime,time,subprocess,shlex
-root=pathlib.Path(os.environ['CCAM_HOME']);account=os.environ['CCAM_PROFILE'];mode=os.environ['CHAT_FIXTURE_MODE'];args=sys.argv[1:];raw_input=sys.stdin.read();prompt=raw_input
+root=pathlib.Path(os.environ['CCAM_HOME']);account=os.environ['CCAM_PROFILE'];mode=os.environ['CHAT_FIXTURE_MODE'];args=sys.argv[1:]
+initialize=json.loads(sys.stdin.readline());assert initialize['type']=='control_request' and initialize['request']['subtype']=='initialize'
+print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':initialize['request_id'],'response':{}}}),flush=True)
+raw_input=sys.stdin.readline();prompt=raw_input
 content=prompt
 if '--input-format' in args:
     envelope=json.loads(raw_input);assert envelope['type']=='user' and envelope['message']['role']=='user'
@@ -94,7 +106,7 @@ def hook(name,extra={}):
     result=subprocess.run(shlex.split(command),input=json.dumps(payload),env=env,text=True,capture_output=True)
     assert result.returncode==0,result.stderr
 def emit(event):print(json.dumps({'session_id':sid,**event}),flush=True)
-if mode!='identityless':hook('SessionStart')
+if mode not in ('identityless','approval-identityless'):hook('SessionStart')
 emit({'type':'system','subtype':'init','permissionMode':'default' if mode=='auto-fallback' else value('--permission-mode')})
 if mode=='auto-fallback':emit({'type':'system','subtype':'status','permissionMode':'default'})
 if mode=='auto-plan':emit({'type':'system','subtype':'status','permissionMode':'plan'})
@@ -102,11 +114,35 @@ now=datetime.datetime.now(datetime.timezone.utc).isoformat()
 with transcript.open('a') as f:f.write(json.dumps({'type':'user','uuid':str(uuid.uuid4()),'timestamp':now,'sessionId':sid,'permissionMode':'manual','message':{'role':'user','content':content}})+'\n')
 work=pathlib.Path.cwd()/'work-state.json';state=json.loads(work.read_text()) if work.exists() else []
 state.append('continued-'+account if prompt.startswith('上一个账号的额度已耗尽') else 'user:'+prompt);work.write_text(json.dumps(state))
+if mode.startswith('approval'):
+    tool='AskUserQuestion' if mode=='approval-question' else 'ExitPlanMode' if mode in ('approval-plan','approval-plan-empty') else 'Bash'
+    tool_input={'command':'git -C ./repo status --short','description':'查看仓库状态'}
+    if tool=='AskUserQuestion':tool_input={'questions':[{'header':'范围','question':'要查看哪个仓库？','options':[{'label':'全部','description':'六个子仓库'},{'label':'当前','description':'当前项目'}],'multiSelect':False},{'header':'检查','question':'检查哪些内容？','options':[{'label':'分支','description':'当前分支'},{'label':'改动','description':'工作区状态'}],'multiSelect':True}]}
+    if tool=='ExitPlanMode':tool_input={} if mode=='approval-plan-empty' else {'plan':'先检查六个子仓库状态，再逐个安全拉取。','allowedPrompts':[{'tool':'Bash','prompt':'inspect git status'}]}
+    request={'type':'control_request','request_id':'permission-1','request':{'subtype':'can_use_tool','tool_name':tool,'tool_use_id':'use-1','input':tool_input,'decision_reason':'需要你的确认'}}
+    if mode=='approval-mismatched':request['session_id']=str(uuid.uuid4())
+    if mode=='approval-background':
+        emit({'type':'system','subtype':'session_state_changed','state':'running','sdk_host_only':True})
+        emit({'type':'result','subtype':'success','is_error':False,'result':'后台任务仍在处理'})
+    emit(request)
+    if mode=='approval-duplicate':emit(request)
+    if mode=='approval-changed':
+        emit({**request,'request':{**request['request'],'input':{'command':'different command'}}});time.sleep(30);sys.exit(0)
+    if mode=='approval-cancel':
+        time.sleep(.15);emit({'type':'control_cancel_request','request_id':'permission-1'})
+    else:
+        raw=sys.stdin.readline()
+        if not raw:sys.exit(0)
+        reply=json.loads(raw);assert reply['type']=='control_response';response=reply['response'];assert response['request_id']=='permission-1' and response['subtype']=='success'
+        with (root/'replies').open('a') as f:f.write(json.dumps(response)+'\n')
+        if response['response']['behavior']=='allow':
+            assert 'updatedPermissions' not in response['response']
+            (root/'approved').write_text('once')
 if mode=='slow':
     emit({'type':'assistant','message':{'id':'slow','content':[{'type':'text','text':'Working'}]}});time.sleep(30);sys.exit(0)
 if mode=='ordinary':
     emit({'type':'result','subtype':'error_during_execution','is_error':True,'errors':['network error rate_limit text is not a hook']});sys.exit(7)
-limited=mode in ('limit','consecutive') and (account=='first' or mode=='consecutive' and account=='second')
+limited=mode in ('limit','consecutive','approval-limit') and (account=='first' or mode=='consecutive' and account=='second')
 if limited:
     msg="You've hit your session limit · resets 3:30am (Asia/Seoul)"
     row={'type':'assistant','uuid':str(uuid.uuid4()),'timestamp':now,'sessionId':sid,'apiError':'usage_limit_reached','error':'rate_limit','isApiErrorMessage':True,'message':{'model':'<synthetic>','role':'assistant','content':[{'type':'text','text':msg}]},'apiErrorParams':{'rate_limit_info':{'status':'rejected','rateLimitType':'five_hour','resetsAt':int(time.time()+3600)}},'quotaLimits':{'status':'rejected','rateLimitType':'five_hour','resetsAt':int(time.time()+3600)}}
@@ -122,6 +158,8 @@ for index,text in [(0,'第一段完成'),(2,'第二段完成')]:
 emit({'type':'assistant','message':{'id':'msg-'+sid,'content':[{'type':'tool_use','id':'tool1','name':'Read','input':{'file_path':'a.txt'}}]}})
 emit({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'tool1','content':'fixture tool result'}]}})
 emit({'type':'result','subtype':'success','is_error':False,'result':'第二段完成','permission_denials':[{'tool_name':'Bash','tool_use_id':'denied','tool_input':{}}] if mode=='permission' else []})
+if mode=='approval-background':emit({'type':'system','subtype':'session_state_changed','state':'idle','sdk_host_only':True})
+if mode in ('approval-background','approval-duplicate'):assert sys.stdin.read()==''
 """#
     }
 
@@ -168,8 +206,17 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'第二段�
             f.send("restore account default")
             let defaultArgs = f.runs[2]["args"] as! [String]
             check(value("--model", in: defaultArgs) == "default" && !defaultArgs.contains("--effort"), "default model explicitly clears the previous override and default effort is omitted")
-            let terminal = try GlobalPool.prepareChatTerminal(target: f.runtime.terminalFallback); defer { GlobalPool.clean(terminal) }
+            let terminal = try GlobalPool.prepareChatTerminal(target: f.runtime.terminalFallback, baseEnvironment: f.environment); defer { GlobalPool.clean(terminal) }
             check(value("--model", in: terminal.args) == "default" && terminal.args.contains(sid!) && value("--permission-mode", in: terminal.args) == "default", "terminal takeover retains exact session and selected model/mode")
+            let terminalSettings = try JSONSerialization.jsonObject(with: Data(value("--settings", in: terminal.args)!.utf8)) as! [String: Any]
+            let terminalHooks = terminalSettings["hooks"] as? [String: Any]
+            check(terminalHooks?["SessionStart"] != nil && terminal.environment["CCAM_DESKTOP_CHAT"] == "1", "terminal takeover captures its verified return identity")
+            let injected = terminalSettings["env"] as? [String: String] ?? [:]
+            check(ExecutionProxy.proxyKeys.allSatisfy { injected[$0] == terminal.environment[$0] } && injected["NO_PROXY"] == ExecutionProxy.loopbackBypass, "CLI flag settings pin the same mandatory proxy against project settings overrides")
+            let replacement = try GlobalPool.prepare(directory: f.project.path, continueLast: false, baseEnvironment: terminal.environment)
+            defer { GlobalPool.clean(replacement) }
+            let replacementSettings = try JSONSerialization.jsonObject(with: Data(value("--settings", in: replacement.args)!.utf8)) as! [String: Any]
+            check((replacementSettings["hooks"] as? [String: Any])?["SessionStart"] != nil, "later terminal account-pool launches keep SessionStart identity capture")
             let messages = f.runtime.currentMessages
             f.runtime.createConversation(); let secondID = f.runtime.selectedID!
             try f.runtime.deleteConversation(id: originalID)
@@ -202,7 +249,7 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'第二段�
             check(f.runs.count == 2 && f.runs[1]["account"] as? String == "first" && f.runs[1]["sid"] as? String == sid, "second turn resumes same account and exact session")
             let args = f.runs[1]["args"] as! [String]
             check(args.contains("--resume") && args.contains(sid!) && !args.contains("--continue"), "ordinary continuation never chooses latest conversation")
-            check(!args.contains("bypassPermissions") && args.contains("manual") && args.contains("none"), "default print turn never bypasses permissions")
+            check(!args.contains("bypassPermissions") && args.contains("manual") && args.contains("host") && args.contains("stdio"), "default print turn routes approval to the native UI without bypass")
             check(f.starts.count == 2, "browser/settings preflight runs on each turn")
             let reopened = try ChatStore(project: f.project, fileURL: f.store.fileURL)
             check(reopened.conversations[0].sessionID == sid && reopened.conversations[0].messages.filter { $0.role == "user" }.count == 2, "persisted conversation survives reopen")
@@ -210,6 +257,12 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'第二段�
             check(f.runtime.currentConversationTransferred && f.runs.count == 2, "terminal transfer prevents concurrent graphical sends")
             let transferred = try ChatStore(project: f.project, fileURL: f.store.fileURL)
             check(transferred.conversations[0].transferredToTerminal, "terminal transfer persists across restart")
+            let transferredID = f.runtime.currentConversation!.id
+            f.runtime.createConversation()
+            try f.runtime.restoreFromTerminal(conversationID: transferredID)
+            check(f.runtime.selectedID != transferredID && f.runtime.conversations.first { $0.id == transferredID }?.transferredToTerminal == false, "return restores the captured conversation without changing a newer selection")
+            f.runtime.select(id: transferredID); f.send("resume after terminal failed")
+            check(f.runs.last?["sid"] as? String == sid && f.runs.last?["account"] as? String == "first", "return resumes the verified original session and account")
         }
         do {
             let f = try Fixture(); defer { f.clean() }
@@ -220,9 +273,9 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'第二段�
             let sid = f.runtime.currentConversation!.sessionID!
             func value(_ flag: String, in args: [String]) -> String? { args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
             let args = f.runs[0]["args"] as! [String]
-            check(value("--permission-mode", in: args) == "auto" && value("--permission-prompts", in: args) == "none", "Auto reaches the native headless permission classifier")
+            check(value("--permission-mode", in: args) == "auto" && value("--permission-prompts", in: args) == "host", "Auto keeps its classifier and exposes any human prompts to the host")
             check(!args.contains("bypassPermissions") && !args.contains("dontAsk"), "Auto never substitutes blanket permission bypass")
-            let terminal = try GlobalPool.prepareChatTerminal(target: f.runtime.terminalFallback); defer { GlobalPool.clean(terminal) }
+            let terminal = try GlobalPool.prepareChatTerminal(target: f.runtime.terminalFallback, baseEnvironment: f.environment); defer { GlobalPool.clean(terminal) }
             check(value("--permission-mode", in: terminal.args) == "auto" && terminal.args.contains(sid), "terminal takeover preserves Auto and the exact session")
             f.send("Auto follow-up")
             let resumed = f.runs[1]["args"] as! [String]
@@ -271,7 +324,140 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'第二段�
         }
         do {
             let f = try Fixture("permission"); defer { f.clean() }; f.send("needs permission")
-            check(f.runtime.needsTerminalInteraction && f.runtime.stateText.contains("权限"), "result permission_denials overrides success label")
+            check(!f.runtime.needsTerminalInteraction && f.runtime.currentMessages.contains { $0.role == "notice" && $0.text.contains("权限规则拒绝") }, "policy denials are explained without forcing terminal takeover")
+            check(!f.runtime.stateText.contains("已完成"), "blocked operations are not labeled completed")
+        }
+        for mode in ["approval", "approval-duplicate", "approval-background"] {
+            let f = try Fixture(mode); defer { f.clean() }
+            f.runtime.send(text: "check the repository")
+            spin { !f.runtime.pendingApprovals.isEmpty }
+            check(f.runtime.hasRunning && f.runtime.pendingApprovals.count == 1 && f.replies.isEmpty, "\(mode) waits on writable stdin without auto-allow or terminal transfer")
+            let approval = f.runtime.pendingApprovals[0]
+            check(approval.kind == .tool && approval.toolName == "Bash" && approval.inputDescription.contains("git -C ./repo status") && approval.canApprove, "\(mode) presents the real tool and arguments")
+            try f.runtime.approve(id: approval.id)
+            spin { !f.runtime.hasRunning }
+            let result = f.replies.first?["response"] as? [String: Any]
+            check(f.replies.count == 1 && result?["behavior"] as? String == "allow" && result?["updatedPermissions"] == nil, "\(mode) sends exactly one scoped allow only after user action")
+            check((result?["updatedInput"] as? [String: Any])?["command"] as? String == "git -C ./repo status --short", "\(mode) preserves exact approved arguments")
+            check(!f.runtime.hasRunning && f.runtime.pendingApprovals.isEmpty && !f.runtime.needsTerminalInteraction, "\(mode) finishes and clears approval state")
+            do { try f.runtime.approve(id: approval.id); check(false, "old approval rejected") } catch { check(f.replies.count == 1, "repeated click cannot send a second response") }
+        }
+        do {
+            let f = try Fixture("approval"); defer { f.clean() }
+            f.runtime.send(text: "deny this operation"); spin { !f.runtime.pendingApprovals.isEmpty }
+            let id = f.runtime.pendingApprovals[0].id
+            try f.runtime.deny(id: id, message: "只检查文件，不运行命令。")
+            spin { !f.runtime.hasRunning }
+            let result = f.replies.first?["response"] as? [String: Any]
+            check(result?["behavior"] as? String == "deny" && result?["message"] as? String == "只检查文件，不运行命令。", "denial returns the user's explanation to the same request")
+            check(!FileManager.default.fileExists(atPath: f.root.appendingPathComponent("approved").path), "denied tool never executes")
+        }
+        do {
+            let f = try Fixture("approval-question"); defer { f.clean() }
+            f.runtime.send(text: "ask me"); spin { !f.runtime.pendingApprovals.isEmpty }
+            let approval = f.runtime.pendingApprovals[0]
+            check(approval.kind == .question && approval.questions.count == 2 && approval.questions[1].multiSelect, "questions retain labels and multi-select semantics")
+            do { try f.runtime.approve(id: approval.id); check(false, "question cannot be approved without answers") } catch { check(f.replies.isEmpty, "generic approval cannot answer questions implicitly") }
+            do { try f.runtime.answer(id: approval.id, answers: ["要查看哪个仓库？": "全部"]); check(false, "partial answers rejected") } catch { check(f.replies.isEmpty, "partial answer is not sent") }
+            let answers = ["要查看哪个仓库？": "全部", "检查哪些内容？": "分支, 改动"]
+            try f.runtime.answer(id: approval.id, answers: answers); spin { !f.runtime.hasRunning }
+            let updated = (f.replies.first?["response"] as? [String: Any])?["updatedInput"] as? [String: Any]
+            check(updated?["answers"] as? [String: String] == answers && (updated?["questions"] as? [Any])?.count == 2, "answers use exact question keys and preserve original questions")
+        }
+        for mode in ["approval-plan", "approval-plan-empty"] {
+            let f = try Fixture(mode); defer { f.clean() }
+            f.runtime.send(text: "plan the task", permissionMode: .plan); spin { !f.runtime.pendingApprovals.isEmpty }
+            let approval = f.runtime.pendingApprovals[0]
+            check(approval.kind == .plan, "ExitPlanMode is shown as explicit plan approval")
+            if mode == "approval-plan" {
+                check(approval.canApprove && approval.inputDescription.contains("先检查六个子仓库"), "plan body is available for review before approval")
+                try f.runtime.approve(id: approval.id)
+            } else {
+                check(!approval.canApprove, "missing plan cannot be silently approved")
+                do { try f.runtime.approve(id: approval.id); check(false, "empty plan rejected") } catch { check(f.replies.isEmpty, "empty plan produces no allow") }
+                try f.runtime.deny(id: approval.id)
+            }
+            spin { !f.runtime.hasRunning }
+            check(f.replies.count == 1, "plan receives one explicit decision")
+        }
+        do {
+            let f = try Fixture("approval"); defer { f.clean() }
+            f.runtime.send(text: "first request"); spin { !f.runtime.pendingApprovals.isEmpty }
+            let oldID = f.runtime.pendingApprovals[0].id
+            f.runtime.stop(); spin { !f.runtime.hasRunning }
+            check(f.runtime.pendingApprovals.isEmpty && f.replies.isEmpty, "stop invalidates pending approvals without granting anything")
+            f.runtime.send(text: "second request"); spin { !f.runtime.pendingApprovals.isEmpty }
+            do { try f.runtime.approve(id: oldID); check(false, "previous generation approval rejected") } catch { check(f.replies.isEmpty, "same wire request ID in a new run does not make stale UI clickable") }
+            try f.runtime.deny(id: f.runtime.pendingApprovals[0].id); spin { !f.runtime.hasRunning }
+        }
+        do {
+            let f = try Fixture("approval-cancel"); defer { f.clean() }
+            f.runtime.send(text: "cancel request"); spin { !f.runtime.pendingApprovals.isEmpty }
+            let id = f.runtime.pendingApprovals[0].id; spin { !f.runtime.hasRunning }
+            check(f.runtime.pendingApprovals.isEmpty && f.replies.isEmpty, "CLI cancellation removes the request without sending a stale response")
+            do { try f.runtime.approve(id: id); check(false, "canceled approval rejected") } catch { check(true, "canceled request cannot be approved") }
+        }
+        do {
+            let f = try Fixture("approval-identityless"); defer { f.clean() }
+            f.runtime.send(text: "unverified request"); spin { !f.runtime.pendingApprovals.isEmpty }
+            do { try f.runtime.approve(id: f.runtime.pendingApprovals[0].id); check(false, "unverified identity rejected") } catch { check(f.replies.isEmpty, "approval requires verified session identity") }
+        }
+        do {
+            let f = try Fixture("approval-changed"); defer { f.clean() }; f.send("changed request")
+            check(!f.runtime.hasRunning && f.replies.isEmpty && f.runtime.pendingApprovals.isEmpty, "a changed payload reusing a request ID fails closed")
+        }
+        do {
+            let f = try Fixture("approval-mismatched"); defer { f.clean() }; f.send("wrong session request")
+            check(!f.runtime.hasRunning && f.replies.isEmpty && f.runtime.pendingApprovals.isEmpty && !f.runtime.terminalFallback.canResume, "a request from another session is stopped before showing approval")
+        }
+        do {
+            let f = try Fixture(); defer { f.clean() }
+            let id = UUID().uuidString, sid = UUID().uuidString, ticket = f.root.appendingPathComponent("pending-ticket.json").path
+            let record = ChatConversation(id: id, title: "Return", projectID: f.project.id.uuidString, directory: f.project.path,
+                                          sessionID: sid, account: "first", ticket: ticket, transferredToTerminal: true)
+            try f.store.save([record], selectedID: id)
+            let runtime = try ChatRuntime(project: f.project, store: f.store, environment: f.environment)
+            do { try runtime.restoreFromTerminal(conversationID: id, account: "second"); check(false, "partial return identity rejected") } catch { check(runtime.currentConversationTransferred, "partial identity cannot unlock the conversation") }
+            try runtime.restoreFromTerminal(conversationID: id, account: "first", sessionID: sid, ticket: ticket)
+            check(runtime.currentConversation?.ticket == ticket, "a terminal startup failure preserves an unconsumed handoff ticket")
+            runtime.markTransferredToTerminal()
+            let next = UUID().uuidString
+            try runtime.recordTerminalState(conversationID: id, account: nil, sessionID: nil, ticket: nil, uncertain: true)
+            check(!runtime.terminalFallback.canResume, "pending terminal handoff disables fallback resume")
+            let uncertainStore = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            let uncertainRuntime = try ChatRuntime(project: f.project, store: uncertainStore, environment: f.environment)
+            check(uncertainRuntime.currentConversation?.terminalIdentityUncertain == true && !uncertainRuntime.terminalFallback.canResume, "terminal uncertainty persists across desktop restart")
+            do { try uncertainRuntime.restoreFromTerminal(conversationID: id); check(false, "uncertain identity cannot restore") } catch { check(true, "uncertain terminal cannot guess its old account after restart") }
+            do { try runtime.recordTerminalState(conversationID: id, account: "second", sessionID: nil, ticket: nil, uncertain: false); check(false, "partial terminal identity rejected") } catch { check(!runtime.terminalFallback.canResume, "partial verification cannot clear uncertainty") }
+            try runtime.recordTerminalState(conversationID: id, account: "second", sessionID: next, ticket: nil, uncertain: false)
+            let verifiedStore = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            check(verifiedStore.conversations[0].sessionID == next && verifiedStore.conversations[0].account == "second" && verifiedStore.conversations[0].terminalIdentityUncertain == false, "verified terminal identity is durable before tab close")
+            try runtime.restoreFromTerminal(conversationID: id, account: "second", sessionID: next, ticket: nil)
+            check(runtime.currentConversation?.account == "second" && runtime.currentConversation?.sessionID == next && runtime.currentConversation?.ticket == nil && runtime.currentConversation?.terminalIdentityUncertain == nil, "verified terminal handoff replaces identity, clears consumed ticket and recovery marker")
+        }
+        do {
+            let f = try Fixture("slow"); defer { f.clean() }
+            let id = f.runtime.currentConversation!.id
+            f.runtime.markTransferredToTerminal(); f.runtime.createConversation()
+            f.runtime.send(text: "separate foreground task")
+            spin { f.runtime.currentMessages.contains { $0.role == "assistant" } }
+            let selected = f.runtime.selectedID, messages = f.runtime.currentMessages
+            let next = UUID().uuidString
+            try f.runtime.recordTerminalState(conversationID: id, account: nil, sessionID: nil, ticket: nil, uncertain: true)
+            try f.runtime.recordTerminalState(conversationID: id, account: "second", sessionID: next, ticket: nil, uncertain: false)
+            check(f.runtime.hasRunning && f.runtime.selectedID == selected && f.runtime.currentMessages == messages, "background terminal identity update preserves another actively streaming conversation")
+            check(f.runtime.conversations.first { $0.id == id }?.sessionID == next, "background terminal identity updates while another chat runs")
+        }
+        do {
+            let f = try Fixture("approval-limit"); defer { f.clean() }
+            f.runtime.send(text: "approval then quota handoff"); spin { !f.runtime.pendingApprovals.isEmpty }
+            let oldID = f.runtime.pendingApprovals[0].id
+            try f.runtime.approve(id: oldID)
+            spin { f.runtime.pendingApprovals.first.map { $0.id != oldID } == true }
+            check(f.runs.count == 2 && f.runtime.pendingApprovals.count == 1, "quota handoff keeps native approval available in the resumed session")
+            do { try f.runtime.approve(id: oldID); check(false, "pre-handoff approval rejected") } catch { check(f.replies.count == 1, "old approval cannot authorize the new account's reused wire request ID") }
+            try f.runtime.approve(id: f.runtime.pendingApprovals[0].id); spin { !f.runtime.hasRunning }
+            check(f.replies.count == 2 && f.runtime.currentConversation?.account == "second", "resumed account receives only its own explicit approval")
         }
         do {
             let f = try Fixture("identityless"); defer { f.clean() }; f.send("first")
@@ -309,14 +495,72 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'第二段�
         }
         do {
             let f = try Fixture(); defer { f.clean() }
-            f.runtime.beforeStart = { _ in throw AppError.message("browser lock rejected") }; f.send("blocked")
+            let original = f.runtime.conversations
+            f.runtime.beforeStart = { _ in throw AppError.message("browser lock rejected") }
+            check(!f.runtime.send(text: "blocked"), "a failed preflight returns false so the composer retains its text")
             check(f.runs.isEmpty && !f.runtime.hasRunning, "browser guard rejection prevents process launch")
+            check(f.runtime.conversations == original && f.runtime.stateText.contains("browser lock rejected"), "preflight failure restores all conversation metadata and exposes the error")
+            let reopened = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            check(sameSavedMetadata(reopened.conversations, original), "failed preflight never leaves a sent user message on disk")
             let secret = "ANTHROPIC_API_KEY=fixture-secret Bearer fixture.bearer sk-ant-fixture-token"
             var conversation = f.runtime.conversations[0]; conversation.messages = [ChatMessage(role: "tool", text: secret)]
             try f.store.save([conversation], selectedID: conversation.id)
             let saved = try String(contentsOf: f.store.fileURL, encoding: .utf8)
             check(!saved.contains("fixture-secret") && !saved.contains("fixture.bearer") && !saved.contains("sk-ant-fixture-token"), "known credentials are redacted in the app's saved copy")
             check(conversation.messages[0].text == secret, "redaction never rewrites original prompt or in-memory tool result")
+        }
+        do {
+            let f = try Fixture(); defer { f.clean(); unsetenv("CCAM_DESKTOP_DATA_DIR") }
+            setenv("CCAM_DESKTOP_DATA_DIR", f.root.appendingPathComponent("desktopdata").path, 1)
+            let files = ChatAttachmentStore(project: f.project)
+            let attachment = try files.stageImage(data: imageData(), existing: [])
+            try f.runtime.setDraftAttachments([attachment])
+            let original = f.runtime.conversations
+            let runtime = try ChatRuntime(project: f.project, store: f.store,
+                                          ccamExecutable: f.root.appendingPathComponent("missing-executable").path,
+                                          environment: f.environment)
+            check(!runtime.send(text: "message with an image"), "Process.run failure reports a rejected send")
+            check(!runtime.hasRunning && runtime.conversations == original && runtime.currentAttachments == [attachment], "spawn failure restores the user text record, generated title and draft attachments")
+            let reopened = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            check(sameSavedMetadata(reopened.conversations, original) && f.runs.isEmpty, "spawn failure rolls back the pre-spawn metadata commit on disk")
+        }
+        do {
+            let f = try Fixture(); defer { f.clean() }
+            let original = f.runtime.conversations
+            let folder = f.store.fileURL.deletingLastPathComponent(), backup = f.root.appendingPathComponent("saved-desktop")
+            try FileManager.default.moveItem(at: folder, to: backup)
+            try Data("blocked metadata directory".utf8).write(to: folder)
+            check(!f.runtime.send(text: "must not run when save fails"), "metadata failure prevents accepting the send")
+            check(!f.runtime.hasRunning && f.runs.isEmpty && f.runtime.conversations == original && f.runtime.stateText.contains("保存失败"), "metadata failure leaves draft and history intact and never spawns Claude")
+            try FileManager.default.removeItem(at: folder); try FileManager.default.moveItem(at: backup, to: folder)
+            let reopened = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            check(sameSavedMetadata(reopened.conversations, original), "original metadata survives an unavailable save location")
+        }
+        do {
+            let f = try Fixture(); defer { f.clean() }
+            let original = f.runtime.conversations, state = f.runtime.stateText
+            var called = false
+            do {
+                try f.runtime.transferToTerminal { target in
+                    called = true
+                    let saved = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+                    check(f.runtime.currentConversationTransferred && saved.conversations[0].transferredToTerminal && target.conversationID == f.runtime.selectedID,
+                          "terminal ownership is durable before the launch callback can create a process")
+                    throw AppError.message("terminal preflight rejected")
+                }
+                check(false, "terminal start failure propagated")
+            } catch { check(called && error.localizedDescription == "terminal preflight rejected", "terminal launch failure reaches the caller") }
+            check(f.runtime.conversations == original && !f.runtime.currentConversationTransferred && f.runtime.stateText == state,
+                  "failed terminal preparation restores the original editable chat state")
+            let restored = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            check(sameSavedMetadata(restored.conversations, original), "terminal preparation failure rolls ownership back on disk")
+            let folder = f.store.fileURL.deletingLastPathComponent(), backup = f.root.appendingPathComponent("saved-transfer-state")
+            try FileManager.default.moveItem(at: folder, to: backup); try Data("blocked".utf8).write(to: folder)
+            called = false
+            do { try f.runtime.transferToTerminal { _ in called = true }; check(false, "unwritable transfer rejected") }
+            catch { check(!called && !f.runtime.currentConversationTransferred && f.runtime.conversations == original,
+                          "failed ownership save never invokes terminal start or locks the chat") }
+            try FileManager.default.removeItem(at: folder); try FileManager.default.moveItem(at: backup, to: folder)
         }
         do {
             let f = try Fixture("limit"); defer { f.clean(); unsetenv("CCAM_DESKTOP_DATA_DIR") }
@@ -340,7 +584,8 @@ emit({'type':'result','subtype':'success','is_error':False,'result':'第二段�
             check(input.hasSuffix("\n") && (f.runs[0]["args"] as? [String] ?? []).contains("stream-json"), "structured user frame is newline terminated")
             let scope = try files.url(for: file).deletingLastPathComponent().path
             check(f.starts.allSatisfy { $0.contains("--add-dir") && $0.contains(scope) && !$0.contains(source.deletingLastPathComponent().path) }, "file permissions follow the exact private copy across handoff")
-            check(f.runs[1]["prompt"] as? String == GlobalPool.continuationPrompt && !(f.runs[1]["args"] as? [String] ?? []).contains("--input-format"), "handoff uses transcript content without resending attachments")
+            let resumedBlocks = f.runs[1]["content"] as? [[String: Any]] ?? []
+            check(f.runs[1]["prompt"] as? String == GlobalPool.continuationPrompt && resumedBlocks.count == 1 && resumedBlocks[0]["type"] as? String == "text", "handoff keeps interactive stdin while using transcript without resending attachments")
             check(f.runtime.currentAttachments.isEmpty && f.runtime.currentMessages.first?.attachments?.count == 2, "sent attachments move from draft into history")
             let saved = try String(contentsOf: f.store.fileURL, encoding: .utf8)
             check(!saved.contains(bytes.base64EncodedString()), "desktop history persists metadata instead of image blobs")

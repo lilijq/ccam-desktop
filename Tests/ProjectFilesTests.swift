@@ -69,6 +69,25 @@ import Darwin
         rejects("invalid UTF-8 rejected") { _ = try store.read("legacy-encoding") }
         let small = try ProjectFileStore(directory: project.path, maximumBytes: 4)
         rejects("oversized file rejected") { _ = try small.read("folder/deep.txt") }
+        check(try store.previewData("binary", maximumBytes: 3) == Data([0, 1, 2]), "binary previews use bounded bytes without treating them as text")
+        rejects("preview size limit rejects excess data") { _ = try store.previewData("binary", maximumBytes: 2) }
+        rejects("preview bytes cannot follow an outside link") { _ = try store.previewData("outside-link") }
+        rejects("preview metadata cannot follow an outside link") { _ = try store.previewInfo("outside-link") }
+        rejects("preview metadata rejects traversal") { _ = try store.previewInfo("../outside/secret.txt") }
+        let metadata = try store.previewInfo("binary")
+        check(metadata.byteCount == 3 && metadata.resolvedPath == "binary", "metadata identifies the validated in-project file")
+        check(try store.externalURL(for: metadata) == store.root.appendingPathComponent("binary"), "external opening resolves only the validated file")
+        let internalInfo = try store.previewInfo("internal-link")
+        try fm.removeItem(at: project.appendingPathComponent("internal-link"))
+        try fm.createSymbolicLink(at: project.appendingPathComponent("internal-link"), withDestinationURL: project.appendingPathComponent("binary"))
+        rejects("external opening rejects a retargeted internal link") { _ = try store.externalURL(for: internalInfo) }
+        try fm.removeItem(at: project.appendingPathComponent("binary"))
+        try fm.createSymbolicLink(at: project.appendingPathComponent("binary"), withDestinationURL: secret)
+        rejects("external opening revalidates a file replaced by an outside link") { _ = try store.externalURL(for: metadata) }
+        let fifo = project.appendingPathComponent("pipe")
+        check(mkfifo(fifo.path, 0o600) == 0, "special-file fixture created")
+        rejects("special-file preview metadata fails without blocking") { _ = try store.previewInfo("pipe") }
+        rejects("special-file preview bytes fail without blocking") { _ = try store.previewData("pipe") }
         check(!(try store.entries()).contains { $0.name.hasPrefix(".ccam-edit-") }, "temporary save files are cleaned up")
         print("PASS: \(count) project file checks")
     }

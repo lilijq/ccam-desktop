@@ -31,6 +31,7 @@ struct ChatConversation: Identifiable, Codable, Equatable {
     var messages: [ChatMessage] = []
     var ticket: String?
     var transferredToTerminal = false
+    var terminalIdentityUncertain: Bool? = nil
     var continuityUnavailable: Bool? = nil
     var options: ChatOptions? = nil
     var deletedAt: Date? = nil

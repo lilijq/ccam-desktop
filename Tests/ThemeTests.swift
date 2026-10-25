@@ -81,7 +81,7 @@ import AppKit
 
         let foregrounds: [(String, NSColor)] = [
             ("text", Theme.text), ("muted", Theme.muted), ("accent", Theme.accent),
-            ("success", Theme.success), ("warning", Theme.warning)
+            ("success", Theme.success), ("warning", Theme.warning), ("danger", Theme.danger)
         ]
         let surfaces: [(String, NSColor)] = [
             ("background", Theme.background), ("panel", Theme.panel), ("sidebar", Theme.sidebar),

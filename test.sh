@@ -36,8 +36,12 @@ swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" -import-objc-head
 .build-cache/pool-tests
 swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" -D PROJECT_FILES_CORE_ONLY Source/ProjectFiles.swift Tests/ProjectFilesTests.swift -o .build-cache/files-tests
 .build-cache/files-tests
+swiftc -O -swift-version 5 -module-cache-path "$PWD/.build-cache" -D CODE_EDITOR_CORE_ONLY Source/CodeEditor.swift Tests/CodeEditorTests.swift -o .build-cache/code-editor-tests
+.build-cache/code-editor-tests
 swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" -D PROJECT_GIT_CORE_ONLY Source/ProjectGit.swift Tests/ProjectGitTests.swift -o .build-cache/git-tests
 .build-cache/git-tests
+swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" Source/GitRepositoryDiscovery.swift Tests/GitRepositoryDiscoveryTests.swift -o .build-cache/git-discovery-tests
+.build-cache/git-discovery-tests
 swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" Source/NetworkEnvironment.swift Source/Core.swift Source/ProjectStore.swift Source/GlobalPool.swift Source/ChatAttachments.swift Source/ChatStore.swift Source/ChatRuntime.swift Tests/ChatTests.swift -o .build-cache/chat-tests
 .build-cache/chat-tests
 swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" Source/ProjectStore.swift Source/ChatAttachments.swift Tests/ChatAttachmentTests.swift -o .build-cache/attachment-tests

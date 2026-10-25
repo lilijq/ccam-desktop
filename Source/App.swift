@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let poolSummary = label("正在读取账号", size: 12, color: Theme.muted)
     private var workspaceSidebar: WorkspaceSidebar!
     private var compactManage: SidebarItemButton!
-    private let compactQuota = SidebarQuotaButton(compact: true)
+    private let compactQuota = SidebarQuotaView(compact: true)
     private var mainBottom: NSLayoutConstraint!
     private var managementPopover: NSPopover?
     private var compactShell = false
@@ -152,10 +152,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 menu.addItem(item)
             }
         }
+        if let project = currentProject {
+            menu.addItem(.separator())
+            let manage = NSMenuItem(title: "对话管理…", action: #selector(manageCompactConversation), keyEquivalent: "")
+            manage.target = self; manage.isEnabled = projectWorkspace.runningCount(for: project.id) == 0
+            menu.addItem(manage)
+        }
         menu.autoenablesItems = false
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: compactNavigation.bounds.height + 4), in: compactNavigation)
     }
     @objc private func newConversationMenu() { newSidebarConversation() }
+    @objc private func manageCompactConversation() {
+        projectWorkspace.showConversationActions(id: projectWorkspace.selectedConversationID ?? "", from: compactNavigation)
+    }
     @objc private func selectSidebarConversation(_ item: NSMenuItem) {
         guard let id = item.representedObject as? String else { return }
         projectWorkspace.selectConversation(id: id); selected = 2; render()
@@ -180,13 +189,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         workspaceSidebar.onNewConversation = { [weak self] in self?.newSidebarConversation() }
         workspaceSidebar.onAddProject = { [weak self] in self?.chooseProject() }
         workspaceSidebar.onProjects = { [weak self] in self?.navigate(to: 0) }
-        workspaceSidebar.onHistory = { [weak self] in self?.navigate(to: 3) }
         workspaceSidebar.onProject = { [weak self] project in self?.showProjectWorkspace(project) }
-        workspaceSidebar.onConversation = { [weak self] id in
-            guard let self else { return }; self.projectWorkspace.selectConversation(id: id); self.selected = 2; self.render()
+        workspaceSidebar.onConversation = { [weak self] project, id in
+            guard let self else { return }
+            self.showProjectWorkspace(project)
+            guard self.currentProject?.id == project.id else { return }
+            self.projectWorkspace.selectConversation(id: id); self.selected = 2; self.render()
         }
-        workspaceSidebar.onConversationActions = { [weak self] id, sender in self?.projectWorkspace.showConversationActions(id: id, from: sender) }
-        workspaceSidebar.onDeletedConversations = { [weak self] sender in self?.projectWorkspace.showDeletedConversations(from: sender) }
+        workspaceSidebar.onConversationActions = { [weak self] project, id, _ in
+            guard let self else { return }
+            self.showProjectWorkspace(project)
+            guard self.currentProject?.id == project.id,
+                  let anchor = self.workspaceSidebar.conversationActionAnchor(projectID: project.id, conversationID: id) else { return }
+            self.projectWorkspace.showConversationActions(id: id, from: anchor)
+        }
+        workspaceSidebar.onDeletedConversations = { [weak self] project, _ in
+            guard let self else { return }
+            self.showProjectWorkspace(project)
+            guard self.currentProject?.id == project.id,
+                  let anchor = self.workspaceSidebar.deletedConversationAnchor(projectID: project.id) else { return }
+            self.projectWorkspace.showDeletedConversations(from: anchor)
+        }
+        workspaceSidebar.onExpansionChange = { [weak self] in self?.updateSidebar() }
         workspaceSidebar.onQuota = { [weak self] in self?.navigate(to: 1) }
         workspaceSidebar.onManage = { [weak self] sender in self?.showManagement(from: sender) }
         compactManage = SidebarItemButton("", symbol: "gearshape") { [weak self] in guard let self else { return }; self.showManagement(from: self.compactManage) }
@@ -209,13 +233,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             let plan = try GlobalPool.prepareChatTerminal(target: target)
             self.showTerminal(projectID: record.id.uuidString)
-            self.terminalWorkspace.openPool(plan: plan, projectID: record.id.uuidString, projectName: record.name)
+            let terminal = self.terminalWorkspace.openPool(plan: plan, projectID: record.id.uuidString, projectName: record.name)
+            terminal.chatConversationID = target.conversationID; terminal.chatReturnTarget = target
+            terminal.onChatReturnStateChanged = { [weak self] updated, uncertain in
+                guard let self else { throw AppError.message("工作台已关闭，未保存终端身份。") }
+                try self.projectWorkspace.recordTerminalState(projectID: record.id, target: updated, uncertain: uncertain)
+            }
         }
-        projectWorkspace.beforeChatStart = { [weak self] record, arguments in try self?.checkBrowserSettings(directory: record.path, arguments: arguments) }
+        projectWorkspace.onReturnFromTerminal = { [weak self] record, target, completion in
+            guard let self else { completion(.failure(AppError.message("工作台已关闭。"))); return }
+            self.terminalWorkspace.returnToChat(projectID: record.id.uuidString, target: target, window: self.window, completion: completion)
+        }
+        projectWorkspace.beforeChatStart = { [weak self] record, arguments in try self?.checkExecutionSettings(directory: record.path, arguments: arguments) }
         terminalWorkspace.onNewShell = { [weak self] in guard let self else { return }; self.openShell(self.terminalProject) }
         terminalWorkspace.onNewTask = { [weak self] in guard let self else { return }; if let record = self.terminalProject { self.startProject(record, continueLast: false) } else { self.chooseProject() } }
         terminalWorkspace.onFinished = { [weak self] in self?.refresh() }
-        terminalWorkspace.beforeManagedStart = { [weak self] directory, args in try self?.checkBrowserSettings(directory: directory, arguments: args) }
+        terminalWorkspace.beforeManagedStart = { [weak self] directory, args in try self?.checkExecutionSettings(directory: directory, arguments: args) }
+        terminalWorkspace.beforeShellStart = { [weak self] directory in
+            if self?.accounts.isEmpty == true && self?.refreshing == true { throw AppError.message("账号正在加载，请稍后重试。") }
+            let environment = try ExecutionProxy.resolve(environment: CCAMClient.environment).environment
+            try ProxySettingsGuard.validate(directory: directory, profileDirectories: self?.accounts.compactMap { $0.dir } ?? [], environment: environment)
+        }
         content = TopAlignedStack(); content.orientation = .vertical; content.alignment = .leading; content.distribution = .fill; content.spacing = 20; content.edgeInsets = NSEdgeInsets(top: 12, left: 0, bottom: 28, right: 0); content.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = content
         sidebarWidth = side.widthAnchor.constraint(equalToConstant: 224)
@@ -237,13 +275,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateWindowLayout(); render(); window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
     private func updateSidebar() {
-        workspaceSidebar?.update(records: projectStore?.activeProjects ?? [], currentID: currentProject?.id,
-                                 items: projectWorkspace.historyItems, selectedID: projectWorkspace.selectedConversationID,
-                                 running: currentProject.map { projectWorkspace.runningCount(for: $0.id) > 0 } ?? false)
+        let records = projectStore?.activeProjects ?? []
+        workspaceSidebar?.prepareProjects(records, currentID: currentProject?.id)
+        let groups = projectWorkspace.sidebarGroups(records: records, expandedIDs: workspaceSidebar?.expandedProjectIDs ?? [])
+        workspaceSidebar?.update(groups: groups, currentID: currentProject?.id)
         updatePoolSummary()
     }
     private func newSidebarConversation() {
         guard let project = currentProject else { chooseProject(); return }
+        workspaceSidebar.revealProject(project.id)
         showProjectWorkspace(project, newConversation: true)
     }
     @objc private func managementMenu() { showManagement(from: compactShell ? compactManage : workspaceSidebar.manageButton) }
@@ -468,6 +508,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appearance.font = Theme.font(size: 13)
         appearanceSelector = appearance
         addSetting(row([label("外观", size: 14), spacer(), appearance]))
+        let proxy = try? ExecutionProxy.resolve(environment: CCAMClient.environment)
+        let proxyStatus = label(proxy.map { $0.endpoint + " · " + $0.sourceSummary } ?? "未配置 · 联网任务已阻止", size: 12, color: proxy == nil ? Theme.warning : Theme.muted)
+        proxyStatus.lineBreakMode = .byTruncatingMiddle
+        addSetting(column([row([label("网络代理", size: 14), spacer(), ClosureButton("设置…") { [weak self] in self?.configureProxy() }]), proxyStatus], spacing: 8))
         addSetting(row([label("Chrome 账号锁", size: 14), spacer(), ClosureButton("管理", symbol: "lock") { [weak self] in self?.showBrowserLocks() }]))
         let location = label(CCAMClient.executable, size: 11, color: Theme.muted)
         location.lineBreakMode = .byTruncatingMiddle
@@ -489,9 +533,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             alert.informativeText = "账号与凭据由 CCAM / Claude Code 管理。项目列表与浏览器锁保存在本机，不读取浏览器 Cookie。\n\n项目不绑定额度。自动续做保留项目目录与对话。开发终端和外部程序不受本应用登录锁控制。\n\n数据位置：" + ProjectStore.defaultURL.deletingLastPathComponent().path
             alert.beginSheetModal(for: self.window)
         }]))
-        let version = label("CCAM Desktop 2.1", size: 12, color: Theme.muted)
+        let version = label("CCAM Desktop " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""), size: 12, color: Theme.muted)
         addSetting(version)
         fillWidth(settings, in: content)
+    }
+    func configureProxy() {
+        let alert = NSAlert(); alert.messageText = "网络代理"
+        alert.informativeText = "聊天、登录和终端统一使用此代理。留空跟随系统；没有有效代理时阻止启动。"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 28))
+        field.placeholderString = "http://127.0.0.1:端口"
+        field.stringValue = UserDefaults.standard.string(forKey: ExecutionProxy.defaultsKey) ?? ""
+        field.setAccessibilityLabel("HTTP 代理地址")
+        alert.accessoryView = field
+        alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            do {
+                if value.isEmpty { UserDefaults.standard.removeObject(forKey: ExecutionProxy.defaultsKey) }
+                else { UserDefaults.standard.set(try ExecutionProxy.validatedEndpoint(value), forKey: ExecutionProxy.defaultsKey) }
+                self.render()
+            } catch { showError(error.localizedDescription, window: self.window) }
+        }
     }
     @objc func changeAppearance(_ sender: NSPopUpButton) {
         guard AppearanceMode.allCases.indices.contains(sender.indexOfSelectedItem) else { return }
@@ -548,8 +612,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var stagedRename: BrowserLock?
         do {
             try BrowserRouting.preflight(args)
-            if args.first == "login" || (args.first == "add" && !args.contains("--api") && !args.contains("--no-login")) {
-                try checkBrowserSettings(directory: directory ?? stableDirectory, account: BrowserRouting.explicitAccount(args))
+            if ExecutionProxy.requiresProxy(arguments: args) {
+                try checkExecutionSettings(directory: directory ?? stableDirectory, arguments: args, account: BrowserRouting.explicitAccount(args))
             }
             if args.first == "rename", args.count == 3 {
                 let store = try BrowserLockStore()
@@ -587,24 +651,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         showTerminal(projectID: context?.id.uuidString)
         terminalWorkspace.open(executable: CCAMClient.executable, args: args, directory: directory, title: title, projectID: context?.id.uuidString, projectName: context?.name)
     }
-    func checkBrowserSettings(directory: String, arguments: [String] = [], account: String? = nil) throws {
+    func checkExecutionSettings(directory: String, arguments: [String] = [], account: String? = nil) throws {
+        if accounts.isEmpty && refreshing { throw AppError.message("账号正在加载，请稍后重试。") }
+        let environment = try ExecutionProxy.resolve(environment: CCAMClient.environment).environment
+        let paths = accounts.filter { record in account.map { record.name == $0 } ?? true }.compactMap { $0.dir }
+        let claudeArgs = arguments.firstIndex(of: "--").map { Array(arguments.suffix(from: $0 + 1)) } ?? arguments
+        try ProxySettingsGuard.validate(directory: directory, profileDirectories: paths, environment: environment, claudeArguments: claudeArgs)
         let store = try BrowserLockStore()
         guard !store.locks.isEmpty else { return }
         if let account, store.binding(account: account) == nil { return }
-        if !arguments.isEmpty && accounts.isEmpty && refreshing { throw AppError.message("账号正在加载，请稍后重试。") }
-        let environment = CCAMClient.environment
         guard let helper = environment["BROWSER"], URL(fileURLWithPath: helper).lastPathComponent == "CCAMBrowser", FileManager.default.isExecutableFile(atPath: helper) else { throw AppError.message("登录锁组件缺失，请重新打开完整应用。") }
-        let paths = accounts.filter { record in
+        let lockedPaths = accounts.filter { record in
             account.map { record.name == $0 } ?? (store.binding(account: record.name) != nil)
         }.compactMap { $0.dir }
-        let claudeArgs = arguments.firstIndex(of: "--").map { Array(arguments.suffix(from: $0 + 1)) } ?? arguments
-        try BrowserSettingsGuard.validate(directory: directory, profileDirectories: paths, environment: environment, claudeArguments: claudeArgs)
+        try BrowserSettingsGuard.validate(directory: directory, profileDirectories: lockedPaths, environment: environment, claudeArguments: claudeArgs)
     }
     func openShell(_ record: ProjectRecord? = nil) {
         let context = record ?? currentProject
         let directory = context?.path ?? project
         showTerminal(projectID: context?.id.uuidString)
-        terminalWorkspace.open(executable: "/bin/zsh", args: ["-l"], directory: directory, title: "开发终端", projectID: context?.id.uuidString, projectName: context?.name)
+        terminalWorkspace.open(executable: "/bin/zsh", args: ["-d", "-i"], directory: directory, title: "开发终端", projectID: context?.id.uuidString, projectName: context?.name)
     }
     func capture(to path: String) {
         guard let view = window.contentView else { return }; view.layoutSubtreeIfNeeded()

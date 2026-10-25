@@ -113,7 +113,8 @@ final class OperationWindow: NSWindowController, NSWindowDelegate, NSTextFieldDe
         guard !completed else { return }
         if cancelled { finish(code: -1); return }
         do {
-            try session.start(executable: CCAMClient.executable, args: arguments, directory: directory, environment: CCAMClient.environment, rows: 36, cols: 110)
+            let environment = try CCAMClient.executionEnvironment(arguments: arguments)
+            try session.start(executable: CCAMClient.executable, args: arguments, directory: directory, environment: environment, rows: 36, cols: 110)
             disableInputEcho()
             if let initialInput {
                 presentation.hideSubmittedInput(initialInput)

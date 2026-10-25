@@ -48,6 +48,7 @@ struct ChatTerminalTarget {
     var model: String? = nil
     var permissionMode = "default"
     var effort: String? = nil
+    var conversationID: String? = nil
 }
 
 enum GlobalPool {
@@ -67,12 +68,17 @@ enum GlobalPool {
                         helperExecutable: String = CommandLine.arguments[0],
                         ccamExecutable: String = CCAMClient.executable,
                         baseEnvironment: [String: String] = CCAMClient.environment) throws -> PoolLaunch {
+        let baseEnvironment = try ExecutionProxy.resolve(environment: baseEnvironment).environment
         let recovery = automaticallyContinueTask ? try recoveryArguments(ticket: ticket, directory: directory, environment: baseEnvironment) : []
         let token = UUID().uuidString
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ccam-desktop-pool-" + token, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         let helperPath = URL(fileURLWithPath: helperExecutable).standardizedFileURL.path
-        let settings: [String: Any] = ["hooks": ["StopFailure": [["matcher": "rate_limit", "hooks": [["type": "command", "command": Shell.quote(helperPath) + " " + helperFlag, "timeout": 15]]]]]]
+        var hooks: [String: Any] = ["StopFailure": [["matcher": "rate_limit", "hooks": [["type": "command", "command": Shell.quote(helperPath) + " " + helperFlag, "timeout": 15]]]]]
+        if baseEnvironment["CCAM_DESKTOP_CHAT"] == "1" {
+            hooks["SessionStart"] = [["hooks": [["type": "command", "command": Shell.quote(helperPath) + " " + chatHelperFlag, "timeout": 15]]]]
+        }
+        let settings: [String: Any] = ["env": proxySettings(baseEnvironment), "hooks": hooks]
         let json = String(decoding: try JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]), as: UTF8.self)
         var args = ["next", "--auto", "--cross-org", "--max-usage", "100", "--strategy", "headroom"]
         if continueLast || ticket != nil { args.append("--continue") }
@@ -91,6 +97,12 @@ enum GlobalPool {
         env["CCAM_DESKTOP_CCAM"] = ccamExecutable
         env["CCAM_DESKTOP_CWD"] = directory
         return PoolLaunch(args: args, environment: env, eventDirectory: root, token: token, directory: directory, createdAt: Date(), ticket: ticket, automaticallyContinuesTask: automaticallyContinueTask, helperExecutable: helperPath)
+    }
+
+    private static func proxySettings(_ environment: [String: String]) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: (ExecutionProxy.proxyKeys + ["NO_PROXY", "no_proxy"]).compactMap { key in
+            environment[key].map { (key, $0) }
+        })
     }
 
     /// The initial continuation prompt is an explicit quota-recovery operation,
@@ -183,11 +195,12 @@ enum GlobalPool {
         let base = try prepare(directory: directory, continueLast: ticket != nil, ticket: ticket,
                                helperExecutable: helperExecutable, ccamExecutable: ccamExecutable, baseEnvironment: baseEnvironment)
         let hook: [String: Any] = ["type": "command", "command": Shell.quote(base.helperExecutable) + " " + chatHelperFlag, "timeout": 15]
-        let settings: [String: Any] = ["hooks": ["SessionStart": [["hooks": [hook]]], "StopFailure": [["matcher": "rate_limit", "hooks": [hook]]]]]
+        let settings: [String: Any] = ["env": proxySettings(base.environment), "hooks": ["SessionStart": [["hooks": [hook]]], "StopFailure": [["matcher": "rate_limit", "hooks": [hook]]]]]
         let json = String(decoding: try JSONSerialization.data(withJSONObject: settings), as: UTF8.self)
         var prefix = Array(base.args.prefix { $0 != "--" })
         if ticket == nil, let account { prefix = ["run", account] }
-        var claude = ["--print", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompts", "none",
+        var claude = ["--print", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose", "--include-partial-messages",
+                      "--permission-prompts", "host", "--permission-prompt-tool", "stdio",
                       "--permission-mode", permission, "--settings", json]
         // Explicit default clears a model override retained by a resumed session.
         claude += ["--model", model ?? "default"]
@@ -196,30 +209,42 @@ enum GlobalPool {
             if let sessionID { claude += ["--resume", sessionID] }
             else if let newSessionID, UUID(uuidString: newSessionID) != nil { claude += ["--session-id", newSessionID] }
         }
-        var env = base.environment; env["CCAM_DESKTOP_CHAT"] = "1"
+        var env = base.environment; env["CCAM_DESKTOP_CHAT"] = "1"; env["CLAUDE_CODE_SDK_READS_SESSION_STATE"] = "1"
         return PoolLaunch(args: prefix + ["--"] + claude, environment: env, eventDirectory: base.eventDirectory, token: base.token,
                           directory: directory, createdAt: base.createdAt, ticket: ticket, automaticallyContinuesTask: ticket != nil, helperExecutable: base.helperExecutable)
     }
 
-    static func prepareChatTerminal(target: ChatTerminalTarget) throws -> PoolLaunch {
+    static func prepareChatTerminal(target: ChatTerminalTarget,
+                                    helperExecutable: String = CommandLine.arguments[0], ccamExecutable: String = CCAMClient.executable,
+                                    baseEnvironment: [String: String] = CCAMClient.environment) throws -> PoolLaunch {
         guard target.canResume else { throw AppError.message("这段对话的身份未能验证，不能安全转到终端。请新建对话。") }
         let model = try validatedChatModel(target.model), effort = try validatedChatEffort(target.effort)
         var options = ["--permission-mode", try validatedChatPermissionMode(target.permissionMode, interactive: true)]
         options += ["--model", model ?? "default"]
         if let effort { options += ["--effort", effort] }
-        let base = try prepare(directory: target.directory, continueLast: target.ticket != nil, ticket: target.ticket)
+        let base = try prepare(directory: target.directory, continueLast: target.ticket != nil, ticket: target.ticket,
+                               helperExecutable: helperExecutable, ccamExecutable: ccamExecutable, baseEnvironment: baseEnvironment)
+        // Observe the exact terminal session without changing its interactive
+        // permission prompts or its ordinary quota hook output.
+        let hook: [String: Any] = ["type": "command", "command": Shell.quote(base.helperExecutable) + " " + chatHelperFlag, "timeout": 15]
+        let quotaHook: [String: Any] = ["type": "command", "command": Shell.quote(base.helperExecutable) + " " + helperFlag, "timeout": 15]
+        let settings: [String: Any] = ["env": proxySettings(base.environment), "hooks": ["SessionStart": [["hooks": [hook]]], "StopFailure": [["matcher": "rate_limit", "hooks": [quotaHook]]]]]
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: settings), as: UTF8.self)
+        var terminalArgs = base.args
+        if let index = terminalArgs.firstIndex(of: "--settings"), index + 1 < terminalArgs.count { terminalArgs[index + 1] = json }
+        var terminalEnvironment = base.environment; terminalEnvironment["CCAM_DESKTOP_CHAT"] = "1"
         func configured(_ args: [String]) -> PoolLaunch {
-            PoolLaunch(args: args + options, environment: base.environment, eventDirectory: base.eventDirectory, token: base.token,
+            PoolLaunch(args: args + options, environment: terminalEnvironment, eventDirectory: base.eventDirectory, token: base.token,
                        directory: base.directory, createdAt: base.createdAt, ticket: base.ticket,
                        automaticallyContinuesTask: base.automaticallyContinuesTask, helperExecutable: base.helperExecutable)
         }
-        if target.ticket != nil || target.sessionID == nil { return configured(base.args) }
+        if target.ticket != nil || target.sessionID == nil { return configured(terminalArgs) }
         let sessionID = target.sessionID!
         guard UUID(uuidString: sessionID) != nil, let account = target.account,
               account.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil else {
             clean(base); throw AppError.message("原会话的账号身份不完整，无法安全接续。")
         }
-        let claude = Array(base.args.drop(while: { $0 != "--" }).dropFirst())
+        let claude = Array(terminalArgs.drop(while: { $0 != "--" }).dropFirst())
         return configured(["run", account, "--", "--resume", sessionID] + claude)
     }
 

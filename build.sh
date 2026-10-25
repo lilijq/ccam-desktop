@@ -18,10 +18,11 @@ if (( rebuild )); then
     -emit-library -static -emit-module -module-name SwiftTerm -emit-module-path "$BUILD/SwiftTerm/SwiftTerm.swiftmodule" \
     $vendor_sources -o "$BUILD/SwiftTerm/libSwiftTerm.a"
 fi
+app_sources=(Source/*.swift)
 clang -O2 -mmacosx-version-min=13.0 -c Source/PTYBridge.c -o "$BUILD/PTYBridge.o"
 swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" -module-cache-path "$BUILD" -framework AppKit \
   -I "$BUILD/SwiftTerm" -import-objc-header Source/PTYBridge.h "$BUILD/PTYBridge.o" "$BUILD/SwiftTerm/libSwiftTerm.a" \
-  Source/Theme.swift Source/NetworkEnvironment.swift Source/Core.swift Source/QuotaSummary.swift Source/ProjectStore.swift Source/BrowserLockStore.swift Source/BrowserRouting.swift Source/BrowserSettingsGuard.swift Source/BrowserLockWindow.swift Source/GlobalPool.swift Source/PoolCoordinator.swift Source/CommandCatalog.swift Source/UI.swift Source/OperationPresentation.swift Source/OperationWindow.swift Source/PTYSession.swift Source/TerminalCommandFilter.swift Source/TerminalWorkspace.swift Source/FeatureIndex.swift Source/CommandCenterView.swift Source/TaskComposer.swift Source/ChatAttachments.swift Source/AttachmentComposer.swift Source/ChatStore.swift Source/ChatRuntime.swift Source/ProjectChatView.swift Source/ProjectFiles.swift Source/ProjectGit.swift Source/ProjectWorkspace.swift Source/WorkspaceSidebar.swift Source/App.swift Source/App+Projects.swift Source/main.swift \
+  $app_sources \
   -o "$APP/Contents/MacOS/CCAMDesktop"
 cp "$APP/Contents/MacOS/CCAMDesktop" "$APP/Contents/MacOS/CCAMBrowser"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -33,8 +34,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>CCAM Desktop</string>
 <key>CFBundleDisplayName</key><string>CCAM Desktop</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.4.0</string>
-<key>CFBundleVersion</key><string>14</string>
+<key>CFBundleShortVersionString</key><string>2.6.0</string>
+<key>CFBundleVersion</key><string>20</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>AppIcon</string>

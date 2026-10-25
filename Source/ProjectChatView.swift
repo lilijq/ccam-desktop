@@ -10,6 +10,7 @@ private final class ChatDocumentView: NSView {
 /// selected model and mode read as one quiet line of conversation controls.
 private final class ComposerMenuButton: NSPopUpButton {
     var showsMode = false
+    var showsEffort = false
     private var hovering = false
     private var tracking: NSTrackingArea?
 
@@ -19,6 +20,9 @@ private final class ComposerMenuButton: NSPopUpButton {
         font = Theme.font(size: 12, weight: .medium)
     }
     required init?(coder: NSCoder) { fatalError() }
+    // AppKit's pop-up bezel has invisible alignment overhangs. This control
+    // draws its own bounds, so adjacent model/effort/mode hit areas must not overlap.
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
@@ -40,6 +44,7 @@ private final class ComposerMenuButton: NSPopUpButton {
         let color = isEnabled ? Theme.text : Theme.muted
         var x: CGFloat = 8
         var text = titleOfSelectedItem ?? ""
+        if showsEffort && mode.isEmpty { text = "思考" }
         if showsMode {
             text = ["default": "默认", "plan": "计划", "auto": "Auto", "acceptEdits": "编辑"][mode] ?? text
             let symbol = ["default": "hand.raised", "plan": "list.bullet.clipboard", "auto": "sparkle", "acceptEdits": "pencil"][mode] ?? "hand.raised"
@@ -65,6 +70,7 @@ private final class ComposerMenuButton: NSPopUpButton {
 private final class ChatInputView: NSTextView {
     var onSubmit: (() -> Void)?
     var onAttachment: ((NSPasteboard) -> Bool)?
+    var placeholder = "描述任务，或继续提问…" { didSet { needsDisplay = true } }
     override func paste(_ sender: Any?) {
         if isEditable, onAttachment?(NSPasteboard.general) == true { return }
         super.paste(sender)
@@ -85,10 +91,112 @@ private final class ChatInputView: NSTextView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard string.isEmpty else { return }
-        let placeholder = NSAttributedString(string: "描述任务，或继续提问…", attributes: [
+        let placeholder = NSAttributedString(string: self.placeholder, attributes: [
             .font: Theme.font(size: 15), .foregroundColor: Theme.muted
         ])
         placeholder.draw(at: NSPoint(x: textContainerInset.width + 5, y: textContainerInset.height))
+    }
+}
+
+/// Approval stays beside the composer, with the complete operation readable
+/// before a one-time decision. It never changes persistent permission rules.
+final class ChatApprovalCard: ThemeSurface {
+    let approveButton: ClosureButton
+    let denyButton: ClosureButton
+    let detailView = NSTextView()
+
+    init(title: String, detail: String, actionTitle: String, canApprove: Bool,
+         approve: @escaping () -> Void, deny: @escaping () -> Void) {
+        approveButton = ClosureButton(actionTitle, symbol: "checkmark", action: approve)
+        denyButton = ClosureButton("拒绝", symbol: "xmark", action: deny)
+        super.init(Theme.panel, border: Theme.border, radius: 12)
+        let heading = label(title, size: 13, weight: .medium)
+        heading.maximumNumberOfLines = 1; heading.lineBreakMode = .byTruncatingTail; heading.toolTip = title
+        detailView.isEditable = false; detailView.isSelectable = true; detailView.isRichText = false
+        detailView.string = detail; detailView.font = Theme.font(size: 12); detailView.textColor = Theme.text
+        detailView.drawsBackground = false; detailView.textContainerInset = NSSize(width: 0, height: 4)
+        detailView.isVerticallyResizable = true; detailView.isHorizontallyResizable = false
+        detailView.autoresizingMask = [.width]; detailView.textContainer?.widthTracksTextView = true
+        detailView.setAccessibilityLabel("待确认操作详情")
+        let scroll = ThemeScrollView(); scroll.drawsBackground = false; scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.documentView = detailView
+        scroll.heightAnchor.constraint(equalToConstant: 72).isActive = true
+        approveButton.isEnabled = canApprove
+        approveButton.bezelColor = Theme.primary; approveButton.contentTintColor = Theme.onPrimary
+        approveButton.setAccessibilityLabel(actionTitle); denyButton.setAccessibilityLabel("拒绝这次操作")
+        let hint = label("仅本次", size: 11, color: Theme.muted)
+        let actions = row([hint, spacer(), denyButton, approveButton], spacing: 8)
+        let body = column([], spacing: 6)
+        for view in [heading, scroll, actions] { fillWidth(view, in: body) }
+        body.translatesAutoresizingMaskIntoConstraints = false; addSubview(body)
+        NSLayoutConstraint.activate([
+            body.topAnchor.constraint(equalTo: topAnchor, constant: 12), body.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
+            body.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12), body.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+final class ChatQuestionForm: NSView, NSTextFieldDelegate {
+    private let questions: [ChatApprovalQuestion]
+    private var choices: [[NSButton]] = []
+    private var custom: [NSTextField] = []
+    var onChange: (() -> Void)?
+    override var isFlipped: Bool { true }
+
+    init(questions: [ChatApprovalQuestion], width: CGFloat) {
+        self.questions = questions
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 1))
+        let body = column([], spacing: 20); body.translatesAutoresizingMaskIntoConstraints = false; addSubview(body)
+        for (index, question) in questions.enumerated() {
+            let group = column([], spacing: 6)
+            let heading = label(question.question, size: 13, weight: .medium)
+            fillWidth(heading, in: group)
+            var buttons: [NSButton] = []
+            for option in question.options {
+                let button = NSButton(title: option.label, target: self, action: #selector(selectOption(_:)))
+                button.setButtonType(question.multiSelect ? .switch : .radio)
+                button.tag = index; button.font = Theme.font(size: 12)
+                (button.cell as? NSButtonCell)?.wraps = true
+                button.setAccessibilityLabel(option.label); button.toolTip = option.description
+                fillWidth(button, in: group); buttons.append(button)
+                if !option.description.isEmpty { fillWidth(label(option.description, size: 11, color: Theme.muted), in: group) }
+            }
+            choices.append(buttons)
+            let field = NSTextField(string: ""); field.placeholderString = "填写其他回答…"
+            field.font = Theme.font(size: 12); field.delegate = self; field.tag = index
+            field.setAccessibilityLabel("其他回答：" + question.question)
+            custom.append(field); fillWidth(field, in: group); fillWidth(group, in: body)
+        }
+        NSLayoutConstraint.activate([
+            body.topAnchor.constraint(equalTo: topAnchor, constant: 4), body.leadingAnchor.constraint(equalTo: leadingAnchor),
+            body.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16), body.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc private func selectOption(_ sender: NSButton) {
+        let index = sender.tag
+        if !questions[index].multiSelect {
+            for button in choices[index] { button.state = button === sender ? .on : .off }
+            custom[index].stringValue = ""
+        }
+        onChange?()
+    }
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField else { return }
+        if !questions[field.tag].multiSelect, !field.stringValue.isEmpty { choices[field.tag].forEach { $0.state = .off } }
+        onChange?()
+    }
+    var answers: [String: String]? {
+        var result: [String: String] = [:]
+        for (index, question) in questions.enumerated() {
+            var values = choices[index].filter { $0.state == .on }.map(\.title)
+            let text = custom[index].stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { values.append(text) }
+            guard !values.isEmpty else { return nil }
+            result[question.question] = values.joined(separator: ", ")
+        }
+        return result
     }
 }
 
@@ -98,6 +206,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     let project: ProjectRecord
     var onTerminalFallback: ((ChatTerminalTarget) throws -> Void)? { didSet { updateControls() } }
     var onShowTerminal: (() -> Void)? { didSet { updateControls() } }
+    var onReturnFromTerminal: ((ChatTerminalTarget, @escaping (Result<ChatTerminalTarget, Error>) -> Void) -> Void)? { didSet { updateControls() } }
     var onStateChange: (() -> Void)?
     var beforeStart: (([String]) throws -> Void)?
     var hasRunning: Bool { runtime?.hasRunning ?? false }
@@ -112,6 +221,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
 
     private let permissionPicker = ComposerMenuButton(frame: .zero, pullsDown: false)
     private let modelPicker = ComposerMenuButton(frame: .zero, pullsDown: false)
+    private let effortPicker = ComposerMenuButton(frame: .zero, pullsDown: false)
     private let status = label("", size: 12, color: Theme.muted)
     private let history = ThemeScrollView()
     private let document = ChatDocumentView()
@@ -119,12 +229,19 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     private let emptyState = column([], spacing: 12)
     private let input = ChatInputView()
     private let composer = ThemeSurface(Theme.panel, border: Theme.border, radius: 18)
+    private let approvalArea = column([], spacing: 0)
+    private var approvalSignature = ""
+    private var collapsedApproval: NSLayoutConstraint!
+    private var questionSheet: NSAlert?
+    private var questionApprovalID: String?
     private var stateLine: NSStackView!
     private var collapsedState: NSLayoutConstraint!
     private var sendButton: ClosureButton!
     private var stopButton: ClosureButton!
     private var fallbackButton: ClosureButton!
-    private var optionsButton: ClosureButton!
+    private var returnButton: ClosureButton!
+    private var returningConversationID: String?
+    private weak var conversationActionsAnchor: NSView?
     private var attachButton: ClosureButton!
     private let attachments = AttachmentStrip()
     private var attachmentHeight: NSLayoutConstraint!
@@ -216,15 +333,20 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         modelPicker.setAccessibilityLabel("选择模型")
         modelPicker.toolTip = "选择本次对话的模型；切换后保留上下文，发送时生效。"
         modelPicker.target = self; modelPicker.action = #selector(modelChanged)
+        effortPicker.addItems(withTitles: ["默认强度", "低", "中", "高", "很高", "最高"])
+        for (item, value) in zip(effortPicker.itemArray, ["", "low", "medium", "high", "xhigh", "max"]) { item.representedObject = value }
+        effortPicker.showsEffort = true
+        effortPicker.setAccessibilityLabel("选择思考强度")
+        effortPicker.target = self; effortPicker.action = #selector(effortChanged)
         permissionPicker.addItems(withTitles: ["默认模式", "计划模式", "Auto 模式", "允许编辑"])
         for (item, value) in zip(permissionPicker.itemArray, ["default", "plan", "auto", "acceptEdits"]) { item.representedObject = value }
         permissionPicker.showsMode = true
-        for picker in [modelPicker, permissionPicker] {
-            picker.widthAnchor.constraint(equalToConstant: picker === modelPicker ? 90 : 80).isActive = true
+        for (picker, width) in [(modelPicker, 86.0), (effortPicker, 64.0), (permissionPicker, 74.0)] {
+            picker.widthAnchor.constraint(equalToConstant: width).isActive = true
             picker.heightAnchor.constraint(equalToConstant: 32).isActive = true
         }
         permissionPicker.setAccessibilityLabel("选择权限模式")
-        permissionPicker.toolTip = "默认：需要权限时转到终端确认。计划：先分析和规划，修改前确认。Auto：自动评估操作权限，可用性由模型和服务决定。允许编辑：自动允许文件编辑。"
+        permissionPicker.toolTip = "默认：在聊天中逐次确认操作。计划：先分析和规划，修改前确认。Auto：自动评估操作权限，可用性由模型和服务决定。允许编辑：自动允许文件编辑。"
         permissionPicker.target = self; permissionPicker.action = #selector(permissionChanged)
         sendButton = ClosureButton("", symbol: "arrow.up") { [weak self] in self?.send() }
         sendButton.imagePosition = .imageOnly; sendButton.bezelColor = Theme.primary
@@ -240,14 +362,10 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             button.heightAnchor.constraint(equalToConstant: 34).isActive = true
         }
         stopButton.isHidden = true
-        optionsButton = ClosureButton("", symbol: "ellipsis") {}
-        optionsButton.isBordered = false; optionsButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        optionsButton.setAccessibilityLabel("对话设置与操作"); optionsButton.toolTip = "对话设置与操作"
-        optionsButton.actionBlock = { [weak self] in guard let self else { return }; self.showCurrentActions(from: self.optionsButton) }
         attachButton = ClosureButton("", symbol: "paperclip") { [weak self] in self?.chooseAttachments() }
         attachButton.isBordered = false; attachButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
         attachButton.setAccessibilityLabel("添加图片或文件"); attachButton.toolTip = "添加图片或文件；也可以拖入文件或粘贴截图"
-        let controls = row([attachButton, modelPicker, permissionPicker, spacer(), optionsButton, stopButton, sendButton], spacing: 4)
+        let controls = row([attachButton, modelPicker, effortPicker, permissionPicker, spacer(), stopButton, sendButton], spacing: 3)
         let composerBody = column([], spacing: 0)
         attachmentHeight = attachments.heightAnchor.constraint(equalToConstant: 0); attachmentHeight.isActive = true
         attachments.isHidden = true
@@ -275,23 +393,31 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
                 self.onShowTerminal?()
             } else if let handoff = self.onTerminalFallback {
                 do {
-                    try handoff(runtime.terminalFallback)
-                    runtime.markTransferredToTerminal()
+                    try runtime.transferToTerminal(start: handoff)
                     self.refresh()
                 } catch { showError(OperationPresentation.clean(error.localizedDescription), window: self.window) }
             }
         }
         fallbackButton.isBordered = false; fallbackButton.font = Theme.font(size: 12)
         fallbackButton.isHidden = true
+        returnButton = ClosureButton("返回聊天", symbol: "arrow.uturn.backward") { [weak self] in self?.returnFromTerminal() }
+        returnButton.font = Theme.font(size: 12); returnButton.isHidden = true
+        returnButton.setAccessibilityLabel("返回聊天")
+        returnButton.toolTip = "结束该对话的终端任务，保留上下文并恢复聊天。"
         status.maximumNumberOfLines = 1; status.lineBreakMode = .byTruncatingTail
-        stateLine = row([status, spacer(), fallbackButton], spacing: 8)
+        stateLine = row([status, spacer(), returnButton, fallbackButton], spacing: 8)
         stateLine.translatesAutoresizingMaskIntoConstraints = false; addSubview(stateLine)
+        approvalArea.translatesAutoresizingMaskIntoConstraints = false; addSubview(approvalArea)
+        collapsedApproval = approvalArea.heightAnchor.constraint(equalToConstant: 0); collapsedApproval.isActive = true
         collapsedState = stateLine.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             history.topAnchor.constraint(equalTo: topAnchor),
             history.leadingAnchor.constraint(equalTo: leadingAnchor),
             history.trailingAnchor.constraint(equalTo: trailingAnchor),
-            history.bottomAnchor.constraint(equalTo: stateLine.topAnchor, constant: -8),
+            history.bottomAnchor.constraint(equalTo: approvalArea.topAnchor, constant: -8),
+            approvalArea.bottomAnchor.constraint(equalTo: stateLine.topAnchor, constant: -8),
+            approvalArea.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
+            approvalArea.trailingAnchor.constraint(equalTo: composer.trailingAnchor),
             stateLine.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -10),
             composer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -28),
             stateLine.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
@@ -301,6 +427,34 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     func focusInput() { window?.makeFirstResponder(input) }
+
+    func recordTerminalState(target: ChatTerminalTarget, uncertain: Bool) throws {
+        guard let runtime, let id = target.conversationID,
+              GlobalPool.sameDirectory(target.directory, project.path) else {
+            throw AppError.message("无法确认终端对应的聊天记录，暂未更新会话身份。")
+        }
+        try runtime.recordTerminalState(conversationID: id, account: target.account, sessionID: target.sessionID,
+                                        ticket: target.ticket, uncertain: uncertain)
+    }
+
+    private func returnFromTerminal() {
+        guard let runtime, runtime.currentConversationTransferred, !runtime.hasRunning,
+              let id = runtime.selectedID, returningConversationID == nil,
+              let handback = onReturnFromTerminal else { return }
+        saveDraft(); returningConversationID = id; updateControls()
+        handback(runtime.terminalFallback) { [weak self] result in
+            guard let self, self.returningConversationID == id else { return }
+            self.returningConversationID = nil
+            do {
+                let target = try result.get()
+                guard target.canResume, GlobalPool.sameDirectory(target.directory, self.project.path) else {
+                    throw AppError.message("无法确认终端里的原会话，暂未恢复发送。")
+                }
+                try self.runtime?.restoreFromTerminal(conversationID: id, account: target.account, sessionID: target.sessionID, ticket: target.ticket)
+                self.refresh(); if self.runtime?.selectedID == id { self.focusInput() }
+            } catch { self.updateControls(); showError(OperationPresentation.clean(error.localizedDescription), window: self.window) }
+        }
+    }
 
     func stop() { runtime?.stop() }
 
@@ -409,6 +563,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         }
         refreshOptions()
         refreshAttachments()
+        refreshApprovals()
         let visible = (runtime?.currentMessages ?? []).map { message in
             DisplayMessage(id: message.id, role: message.role, text: message.text,
                            title: message.toolName.map(toolTitle), isError: message.role == "error", attachments: message.attachments ?? [])
@@ -416,6 +571,72 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         displayMessages(visible, conversationID: selectedID ?? "", scrollToEnd: changedConversation)
         updateControls()
         onStateChange?()
+    }
+
+    private func refreshApprovals() {
+        let pending = runtime?.pendingApprovals ?? []
+        if let id = questionApprovalID, !pending.contains(where: { $0.id == id }), let sheet = questionSheet {
+            questionApprovalID = nil; questionSheet = nil
+            if let parent = sheet.window.sheetParent { parent.endSheet(sheet.window, returnCode: .abort) }
+        }
+        let signature = pending.map(\.id).joined(separator: "|")
+        guard signature != approvalSignature else { return }
+        approvalSignature = signature
+        for view in approvalArea.arrangedSubviews { approvalArea.removeArrangedSubview(view); view.removeFromSuperview() }
+        collapsedApproval.isActive = pending.isEmpty
+        approvalArea.isHidden = pending.isEmpty
+        guard let request = pending.first else { return }
+        let count = pending.count > 1 ? " · \(pending.count) 项待确认" : ""
+        let title: String, actionTitle: String
+        switch request.kind {
+        case .tool: title = toolTitle(request.toolName) + count; actionTitle = "允许一次"
+        case .question: title = "需要你的回答" + count; actionTitle = "回答问题"
+        case .plan: title = "确认执行计划" + count; actionTitle = "同意计划"
+        }
+        let details = [request.reason, request.inputDescription].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let card = ChatApprovalCard(title: title, detail: details, actionTitle: actionTitle, canApprove: request.canApprove, approve: { [weak self] in
+            guard let self else { return }
+            if request.kind == .question { self.showQuestion(request) }
+            else { self.respondToApproval(id: request.id, allow: true) }
+        }, deny: { [weak self] in self?.respondToApproval(id: request.id, allow: false) })
+        fillWidth(card, in: approvalArea)
+    }
+
+    private func respondToApproval(id: String, allow: Bool) {
+        guard let runtime else { return }
+        do {
+            if allow { try runtime.approve(id: id) } else { try runtime.deny(id: id) }
+        } catch { showError(OperationPresentation.clean(error.localizedDescription), window: window) }
+        refresh()
+    }
+
+    private func showQuestion(_ request: ChatApproval) {
+        guard let window, questionSheet == nil, request.canApprove else { return }
+        let alert = NSAlert(); alert.messageText = "需要你的回答"
+        alert.addButton(withTitle: "提交回答"); alert.addButton(withTitle: "稍后回答")
+        let width = max(260, min(540, window.contentView!.bounds.width - 70))
+        let form = ChatQuestionForm(questions: request.questions, width: width)
+        let scroll = ThemeScrollView(frame: NSRect(x: 0, y: 0, width: width, height: 300))
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
+        scroll.documentView = form; form.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            form.topAnchor.constraint(equalTo: scroll.contentView.topAnchor), form.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            form.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+        ])
+        form.layoutSubtreeIfNeeded()
+        scroll.frame.size.height = min(340, max(120, form.fittingSize.height))
+        alert.accessoryView = scroll; alert.buttons[0].isEnabled = false
+        form.onChange = { [weak form, weak alert] in alert?.buttons.first?.isEnabled = form?.answers != nil }
+        questionSheet = alert; questionApprovalID = request.id
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            self.questionSheet = nil; self.questionApprovalID = nil
+            guard response == .alertFirstButtonReturn, let answers = form.answers,
+                  self.runtime?.pendingApprovals.contains(where: { $0.id == request.id }) == true else { return }
+            do { try self.runtime?.answer(id: request.id, answers: answers) }
+            catch { showError(OperationPresentation.clean(error.localizedDescription), window: self.window) }
+            self.refresh()
+        }
     }
 
     private func updateControls() {
@@ -428,13 +649,20 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         stopButton.isHidden = !active
         permissionPicker.isEnabled = runtime != nil && !active && !transferred
         modelPicker.isEnabled = permissionPicker.isEnabled
-        optionsButton.isEnabled = runtime != nil && !active
+        effortPicker.isEnabled = permissionPicker.isEnabled
         attachButton.isEnabled = runtime != nil && !active && !transferred
-        input.isEditable = runtime != nil && !transferred
+        // A terminal handoff owns execution, not the user's draft. Keep typing
+        // available while requiring an explicit, completed handback to Send.
+        input.isEditable = runtime != nil
+        input.isSelectable = true
+        input.placeholder = transferred ? "可以先写草稿，返回聊天后发送…" : "描述任务，或继续提问…"
         fallbackButton.title = transferred ? "打开终端" : "在终端继续"
         fallbackButton.isHidden = transferred ? onShowTerminal == nil : (!needsInteraction || onTerminalFallback == nil)
-        fallbackButton.isEnabled = !active
-        status.stringValue = startupError ?? (transferred ? "已转到终端" : runtime?.stateText ?? "")
+        fallbackButton.isEnabled = !active && returningConversationID == nil
+        returnButton.isHidden = !transferred || onReturnFromTerminal == nil
+        returnButton.isEnabled = !active && returningConversationID == nil
+        returnButton.title = returningConversationID == runtime?.selectedID ? "正在返回…" : "返回聊天"
+        status.stringValue = startupError ?? (transferred ? "终端中 · 可写草稿" : runtime?.stateText ?? "")
         status.toolTip = status.stringValue
         status.textColor = startupError != nil || needsInteraction ? Theme.warning : Theme.muted
         let idleStates = ["可以开始新任务", "继续这段对话", "已完成，可以继续提问", "已停止，已保存这段对话"]
@@ -456,12 +684,14 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
 
     func selectConversation(id: String) {
         guard let runtime, !runtime.hasRunning, runtime.activeConversations.contains(where: { $0.id == id }) else { return }
-        saveDraft(); runtime.select(id: id); refresh()
+        saveDraft(); runtime.select(id: id); refresh(); focusInput()
     }
 
     private func refreshOptions() {
         let settings = runtime?.currentOptions ?? ChatOptions()
         if let item = permissionPicker.itemArray.first(where: { $0.representedObject as? String == settings.permissionMode.rawValue }) { permissionPicker.select(item) }
+        if let item = effortPicker.itemArray.first(where: { $0.representedObject as? String == (settings.effort ?? "") }) { effortPicker.select(item) }
+        effortPicker.toolTip = "思考强度：" + (settings.effort == nil ? "默认（由模型决定）" : effortPicker.titleOfSelectedItem ?? "默认") + "。发送时生效，可用性由模型决定。"
         if let custom = modelPicker.itemArray.first(where: { $0.tag == 99 }) { modelPicker.menu?.removeItem(custom) }
         let model = settings.model ?? ""
         if let item = modelPicker.itemArray.first(where: { $0.representedObject as? String == model }) { modelPicker.select(item) }
@@ -470,7 +700,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             item.representedObject = model; item.tag = 99
             modelPicker.menu?.insertItem(item, at: 4); modelPicker.select(item)
         }
-        modelPicker.needsDisplay = true; permissionPicker.needsDisplay = true
+        modelPicker.needsDisplay = true; effortPicker.needsDisplay = true; permissionPicker.needsDisplay = true
     }
 
     private func saveOptions(model: String?) {
@@ -500,29 +730,15 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         window.makeFirstResponder(field)
     }
 
-    private func showCurrentActions(from sender: NSView) {
-        showConversationActions(id: runtime?.selectedID ?? "", from: sender)
-    }
-
     func showConversationActions(id: String, from sender: NSView) {
         guard let runtime, !runtime.hasRunning else { return }
+        conversationActionsAnchor = sender
         let menu = NSMenu()
         func add(_ title: String, tag: Int, symbol: String) {
             let item = NSMenuItem(title: title, action: #selector(conversationAction(_:)), keyEquivalent: "")
             item.target = self; item.tag = tag; item.representedObject = id
             item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
             menu.addItem(item)
-        }
-        if id == runtime.selectedID, !runtime.currentConversationTransferred {
-            let effort = NSMenuItem(title: "思考强度", action: nil, keyEquivalent: "")
-            let levels = NSMenu()
-            for (title, value) in [("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high"), ("很高", "xhigh"), ("最高", "max")] {
-                let item = NSMenuItem(title: title, action: #selector(effortChanged(_:)), keyEquivalent: "")
-                item.target = self; item.representedObject = value
-                item.state = (runtime.currentOptions.effort ?? "") == value ? .on : .off
-                levels.addItem(item)
-            }
-            effort.submenu = levels; menu.addItem(effort); menu.addItem(.separator())
         }
         add("新对话", tag: 0, symbol: "square.and.pencil")
         if runtime.activeConversations.contains(where: { $0.id == id }) {
@@ -537,17 +753,17 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
     }
 
-    @objc private func effortChanged(_ item: NSMenuItem) {
-        guard let runtime, let value = item.representedObject as? String else { return }
+    @objc private func effortChanged() {
+        guard let runtime, let value = effortPicker.selectedItem?.representedObject as? String else { return }
         do { try runtime.updateOptions(model: runtime.currentOptions.model, permissionMode: runtime.currentOptions.permissionMode, effort: value.isEmpty ? nil : value) }
         catch { showError(error.localizedDescription, window: window) }
-        optionsButton.toolTip = value.isEmpty ? "对话设置与操作" : "思考强度：" + item.title
+        refreshOptions()
     }
 
     @objc private func conversationAction(_ item: NSMenuItem) {
         guard let runtime, !runtime.hasRunning, let id = item.representedObject as? String else { return }
         if item.tag == 0 { newConversation(); return }
-        if item.tag == 5 { showDeletedConversations(from: optionsButton); return }
+        if item.tag == 5 { showDeletedConversations(from: conversationActionsAnchor ?? self); return }
         guard let conversation = runtime.activeConversations.first(where: { $0.id == id }) else { return }
         switch item.tag {
         case 1: renameConversation(conversation)
@@ -618,13 +834,17 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
 
     private func send() {
         guard let runtime, !runtime.hasRunning, !runtime.currentConversationTransferred else { return }
-        let text = input.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawInput = input.string
+        let text = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !runtime.currentAttachments.isEmpty else { return }
-        let userMessages = runtime.currentMessages.filter { $0.role == "user" }.count
-        runtime.send(text: text)
-        if runtime.hasRunning || runtime.currentMessages.filter({ $0.role == "user" }).count > userMessages {
+        if runtime.send(text: text) {
             input.string = ""; input.needsDisplay = true
             if let id = runtime.selectedID { drafts[id] = "" }
+        } else {
+            // Preparing a first turn may briefly assign an ID before rolling
+            // back. Its onChange callbacks must not erase an unassigned draft.
+            input.string = rawInput; input.needsDisplay = true
+            if let id = runtime.selectedID { drafts[id] = rawInput }
         }
         refresh(); focusInput()
     }
