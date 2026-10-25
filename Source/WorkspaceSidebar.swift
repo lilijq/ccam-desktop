@@ -74,6 +74,8 @@ final class SidebarQuotaGaugeButton: NSButton {
     let scope: Scope
     var snapshot: QuotaGaugeSnapshot? { didSet { needsDisplay = true } }
     var readFailed = false { didSet { needsDisplay = true } }
+    /// The navigation rail keeps both indicators without truncating their labels.
+    var ringOnly = false { didSet { needsDisplay = true } }
     var handler: (() -> Void)?
     private var hovering = false
     private var tracking: NSTrackingArea?
@@ -100,7 +102,7 @@ final class SidebarQuotaGaugeButton: NSButton {
     override func mouseEntered(with event: NSEvent) { hovering = true; needsDisplay = true }
     override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
-    var ringRect: NSRect { NSRect(x: 8, y: (bounds.height - 22) / 2, width: 22, height: 22) }
+    var ringRect: NSRect { NSRect(x: ringOnly ? (bounds.width - 22) / 2 : 8, y: (bounds.height - 22) / 2, width: 22, height: 22) }
     var percentageRect: NSRect { NSRect(x: max(85, bounds.width - 88), y: (bounds.height - 18) / 2, width: min(76, max(0, bounds.width - 97)), height: 18) }
     var displayedPercentage: String {
         guard let remaining = snapshot?.remainingFraction, remaining.isFinite else { return "--" }
@@ -127,11 +129,13 @@ final class SidebarQuotaGaugeButton: NSButton {
         if hovering || isHighlighted {
             Theme.panel.setFill(); NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
         }
-        let label = NSAttributedString(string: title, attributes: [.font: Theme.font(size: 11, weight: .medium), .foregroundColor: Theme.muted])
-        label.draw(at: NSPoint(x: 42, y: (bounds.height - label.size().height) / 2))
-        let style = NSMutableParagraphStyle(); style.alignment = .right
-        NSAttributedString(string: displayedPercentage, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold), .foregroundColor: gaugeColor, .paragraphStyle: style]).draw(in: percentageRect)
-        if snapshot?.stale == true || readFailed {
+        if !ringOnly {
+            let label = NSAttributedString(string: title, attributes: [.font: Theme.font(size: 11, weight: .medium), .foregroundColor: Theme.muted])
+            label.draw(at: NSPoint(x: 42, y: (bounds.height - label.size().height) / 2))
+            let style = NSMutableParagraphStyle(); style.alignment = .right
+            NSAttributedString(string: displayedPercentage, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold), .foregroundColor: gaugeColor, .paragraphStyle: style]).draw(in: percentageRect)
+        }
+        if !ringOnly && (snapshot?.stale == true || readFailed) {
             let icon = NSImage(systemSymbolName: "clock", accessibilityDescription: nil)
             let badge = NSImage(size: NSSize(width: 10, height: 10), flipped: false) { rect in
                 icon?.draw(in: rect); Theme.muted.setFill(); rect.fill(using: .sourceAtop); return true
@@ -244,10 +248,13 @@ struct SidebarProjectGroup {
     var items: [(id: String, title: String)] = []
     var selectedID: String? = nil
     var running = false
+    var visibleIDs: Set<String> = []
+    var runningIDs: Set<String> = []
     var error: String? = nil
 }
 
 final class WorkspaceSidebar: NSView {
+    var onCollapse: (() -> Void)?
     var onNewConversation: (() -> Void)?
     var onAddProject: (() -> Void)?
     var onProjects: (() -> Void)?
@@ -272,7 +279,11 @@ final class WorkspaceSidebar: NSView {
         super.init(frame: frame)
         let mark = NSImageView(image: NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: "账号接力")!)
         mark.contentTintColor = Theme.text; mark.widthAnchor.constraint(equalToConstant: 20).isActive = true; mark.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        let brand = row([mark, label("CCAM", size: 15, weight: .semibold), spacer()], spacing: 9)
+        let collapse = SidebarItemButton("", symbol: "sidebar.left") { [weak self] in self?.onCollapse?() }
+        collapse.setAccessibilityLabel("收起侧边栏"); collapse.toolTip = "收起侧边栏（⌃ ⌘ S）"
+        collapse.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        collapse.rowHeight = 28; collapse.quiet = true
+        let brand = row([mark, label("CCAM", size: 15, weight: .semibold), spacer(), collapse], spacing: 9)
         newButton = SidebarItemButton("新对话", symbol: "square.and.pencil") { [weak self] in self?.onNewConversation?() }
         newButton.rowHeight = 34; newButton.contentInset = 8
         let projectHeading = SidebarItemButton("项目") { [weak self] in self?.onProjects?() }
@@ -284,7 +295,7 @@ final class WorkspaceSidebar: NSView {
         let projectTitle = row([projectHeading, spacer(), add], spacing: 0)
         let top = column([], spacing: 8)
         for view in [brand, newButton!, projectTitle] { fillWidth(view, in: top) }
-        top.setCustomSpacing(18, after: brand); top.setCustomSpacing(20, after: newButton)
+        top.setCustomSpacing(12, after: brand); top.setCustomSpacing(16, after: newButton)
         top.translatesAutoresizingMaskIntoConstraints = false; addSubview(top)
         let projectScroll = makeList(projects)
         projectScroll.setAccessibilityLabel("项目与对话")
@@ -298,7 +309,7 @@ final class WorkspaceSidebar: NSView {
         fillWidth(row([manageButton, spacer()], spacing: 0), in: footer)
         footer.translatesAutoresizingMaskIntoConstraints = false; addSubview(footer)
         NSLayoutConstraint.activate([
-            top.topAnchor.constraint(equalTo: topAnchor, constant: 54), top.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12), top.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            top.topAnchor.constraint(equalTo: topAnchor, constant: 46), top.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12), top.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             brand.heightAnchor.constraint(equalToConstant: 24),
             projectScroll.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 4), projectScroll.leadingAnchor.constraint(equalTo: top.leadingAnchor), projectScroll.trailingAnchor.constraint(equalTo: top.trailingAnchor),
             projectScroll.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -18), projectScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 20),
@@ -331,11 +342,11 @@ final class WorkspaceSidebar: NSView {
     func update(groups: [SidebarProjectGroup], currentID: UUID?) {
         prepareProjects(groups.map(\.project), currentID: currentID)
         self.groups = groups
-        let next = String(describing: groups.map { ($0.project.id, $0.project.name, $0.items.map { [$0.id, $0.title] }, $0.selectedID, $0.running, $0.error) })
+        let next = String(describing: groups.map { ($0.project.id, $0.project.name, $0.items.map { [$0.id, $0.title] }, $0.selectedID, $0.running, $0.visibleIDs.sorted(), $0.runningIDs.sorted(), $0.error) })
             + (currentID?.uuidString ?? "") + expandedProjectIDs.map(\.uuidString).sorted().joined()
         guard next != signature else { return }; signature = next
         let focusID = (window?.firstResponder as? SidebarItemButton)?.identifier
-        newButton.isEnabled = !(groups.first { $0.project.id == currentID }?.running ?? false)
+        newButton.isEnabled = true
         for view in projects.arrangedSubviews { projects.removeArrangedSubview(view); view.removeFromSuperview() }
         actionAnchors.removeAll(); deletedAnchors.removeAll()
         for group in groups {
@@ -364,7 +375,7 @@ final class WorkspaceSidebar: NSView {
             if expanded {
                 let deleted = SidebarItemButton("", symbol: "trash") {}
                 deleted.rowHeight = 32; deleted.contextual = true; deleted.quiet = true
-                deleted.widthAnchor.constraint(equalToConstant: 28).isActive = true; deleted.isEnabled = !group.running
+                deleted.widthAnchor.constraint(equalToConstant: 28).isActive = true; deleted.isEnabled = true
                 deleted.setAccessibilityLabel("已删除的对话：" + project.name); deleted.toolTip = "已删除的对话"
                 deleted.identifier = NSUserInterfaceItemIdentifier("deleted:" + project.id.uuidString)
                 deleted.handler = { [weak self, weak deleted] in guard let deleted else { return }; self?.onDeletedConversations?(project, deleted) }
@@ -379,16 +390,26 @@ final class WorkspaceSidebar: NSView {
                     conversation.selected = project.id == currentID && item.id == group.selectedID
                     conversation.drawsSelection = false; conversation.rowHeight = 32; conversation.contentInset = 12
                     conversation.font = Theme.font(size: 12); conversation.quiet = !conversation.selected
-                    conversation.isEnabled = !group.running; conversation.setContentHuggingPriority(.init(1), for: .horizontal)
+                    conversation.isEnabled = true; conversation.setContentHuggingPriority(.init(1), for: .horizontal)
                     conversation.onSecondaryClick = { [weak self] sender in self?.onConversationActions?(project, item.id, sender) }
                     let more = SidebarItemButton("", symbol: "ellipsis") {}
                     more.rowHeight = 32; more.contextual = true; more.quiet = true
-                    more.widthAnchor.constraint(equalToConstant: 28).isActive = true; more.isEnabled = !group.running
-                    more.setAccessibilityLabel("对话操作：" + title); more.toolTip = "重命名、导出或删除"
+                    more.widthAnchor.constraint(equalToConstant: 28).isActive = true; more.isEnabled = true
+                    more.setAccessibilityLabel("对话操作：" + title); more.toolTip = "分屏、重命名、导出或删除"
                     more.identifier = NSUserInterfaceItemIdentifier("actions:" + project.id.uuidString + ":" + item.id)
                     more.handler = { [weak self, weak more] in guard let more else { return }; self?.onConversationActions?(project, item.id, more) }
                     actionAnchors[project.id.uuidString + ":" + item.id] = more
                     let historyRow = SidebarNavigationRow([conversation, more]); historyRow.selected = conversation.selected; historyRow.accessories = [more]
+                    if group.visibleIDs.contains(item.id) || group.runningIDs.contains(item.id) {
+                        let running = group.runningIDs.contains(item.id)
+                        let status = NSImageView(image: NSImage(systemSymbolName: running ? "circle.dotted" : "rectangle.split.2x1", accessibilityDescription: running ? "对话运行中" : "已在工作台打开")!)
+                        status.contentTintColor = Theme.muted
+                        status.toolTip = running ? "对话运行中" : "已在工作台打开，点击定位"
+                        status.widthAnchor.constraint(equalToConstant: 13).isActive = true
+                        status.heightAnchor.constraint(equalToConstant: 13).isActive = true
+                        historyRow.insertArrangedSubview(status, at: 1)
+                        conversation.toolTip = title + (running ? " · 对话运行中" : " · 已在工作台打开")
+                    }
                     let indent = SidebarBranchGuide(); indent.last = index == group.items.count - 1
                     indent.widthAnchor.constraint(equalToConstant: 40).isActive = true
                     indent.heightAnchor.constraint(equalToConstant: 32).isActive = true

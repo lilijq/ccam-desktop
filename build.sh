@@ -34,9 +34,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>CCAM Desktop</string>
 <key>CFBundleDisplayName</key><string>CCAM Desktop</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.7.0</string>
-<key>CFBundleVersion</key><string>22</string>
+<key>CFBundleShortVersionString</key><string>2.13.1</string>
+<key>CFBundleVersion</key><string>32</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoadsInWebContent</key><true/></dict>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 </dict></plist>
@@ -45,7 +46,7 @@ if [ -f Source/AppIcon.icns ]; then cp Source/AppIcon.icns "$APP/Contents/Resour
 cp Vendor/SwiftTerm/LICENSE "$APP/Contents/Resources/SwiftTerm-LICENSE.txt"
 cp LICENSE "$APP/Contents/Resources/CCAM-Desktop-LICENSE.txt"
 mkdir -p "$APP/Contents/Resources/Translation"
-cp Resources/Translation/translate_worker.py Resources/Translation/NOTICE.md scripts/setup_translation.py "$APP/Contents/Resources/Translation/"
+cp Resources/Translation/translate_worker.py Resources/Translation/native_translation.py Resources/Translation/NOTICE.md scripts/setup_translation.py scripts/setup_native_translation.py "$APP/Contents/Resources/Translation/"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 # Keep the signed archive free of metadata added by cloud-synced folders.

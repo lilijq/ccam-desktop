@@ -22,3 +22,11 @@ Pinned packages:
 The model weights are not modified. The adapter excludes the optional Stanza sentence tokenizer and uses bounded punctuation/paragraph segmentation, preserving fenced code, inline code and identifiable URLs, paths and identifiers. This changes segmentation behavior from the complete Argos application and can affect translation quality. Long clauses may be split; machine translation can misinterpret technical prose. CCAM retains originals alongside translated text.
 
 Inference does not call a translation API or use a Claude account. The setup utility requires the configured HTTP proxy to download the models and Python wheels; the inference subprocess inherits no proxy or account credentials and contains no download path.
+
+## Native technical translation (default after explicit upgrade)
+
+- Model: [Tencent Hy-MT2-1.8B](https://huggingface.co/tencent/Hy-MT2-1.8B), Apache-2.0. Official Q8_0 GGUF from `tencent/Hy-MT2-1.8B-GGUF`, revision `a0c709d9fac510f2c807aa3af52872340dc37a4a`. SHA-256: `5c3fe0b1408a5ceb0143184ef247b11b579c525f4b02b060e6c851bb76fef1a4` (1,908,528,192 bytes).
+- Runtime: [llama.cpp](https://github.com/ggml-org/llama.cpp/releases/tag/b11871), MIT. Official macOS arm64 archive `llama-b11871-bin-macos-arm64.tar.gz`; SHA-256: `389977376e89be4708e3e20c2f0c70b7252d15f5b848e754a26cf5fb06748d7c`.
+- Full model license/model card are retained in the chosen data folder under `licenses/`; runtime license files are retained in `runtime/llama-b11871/`. Neither model nor runtime binary is bundled in CCAM's source or app archive.
+
+The native adapter starts a temporary authenticated loopback server with downloads and web UI disabled. It uses Metal on Apple Silicon. Only the selected local message is translated; no tools or Claude account credentials are passed to the process. The server is stopped when translation finishes or is cancelled. External-drive absence is an explicit error; there is no silent switch back to Argos or a remote provider. The legacy Argos adapter is retained for existing installations until users explicitly upgrade.

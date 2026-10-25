@@ -2,9 +2,15 @@
 
 这份记录由现有本地模型实际执行生成；未调用 Claude、公共翻译接口，也未下载任何内容。
 
-共 24 个样例通过自动检查。引擎为 CTranslate2 4.4.0 / SentencePiece 0.2.0，使用 Argos Translate 1.9 中英双向模型，CPU int8、beam 4。
+共 42 个样例通过自动检查。引擎为 CTranslate2 4.4.0 / SentencePiece 0.2.0，使用 Argos Translate 1.9 中英双向模型，CPU int8、beam 4。
 
 自动检查覆盖：非空输出、目标语言字符、代码/命令/标识符/路径/URL 的精确保留与出现次数、Markdown 标题列表及表格结构、纯代码和纯标点不变，以及选定句子的否定词保留。这些检查不等于语义完全准确；下方保留每一次真实输出，未人工润色。
+
+## 全角波浪号免译约定
+
+`～内容～` 与 `～～内容～～` 都会保留内容、移除外层包裹符，支持多段、多行；例如 `～parrot-ai-server-rust～` 输出 `parrot-ai-server-rust`。未闭合时仅去掉开头标记，其后至文本末尾的内容保持原样。免译内容在分段阶段就被遮蔽，不会进入本地翻译模型输入；原占位符同名文字、代码、链接及表格可组合使用。
+
+代码围栏、行内代码与缩进代码优先保留，其中孤立的 `～` 不会把后续说明吞入免译区域。代码中的全角波浪号不删除。ASCII `~`、`~~删除线~~`、`~~~` 围栏沿用原有规则。需要翻译正文时，免译区域外侧空格可能被整理；只有英文正文、纯免译或纯代码而无需翻译时，除显式包裹符外的字符及空白逐字保留。
 
 ## 已知语义限制
 
@@ -24,7 +30,7 @@
 
 未设置环境变量时，CI 会跳过真实模型测试；测试不会自动联网安装模型。
 
-Worker SHA-256：`9c80519f856b0149bb7fc082d8190e64a2d4948e6ab149f2565f204d3a736c69`
+Worker SHA-256：`3eb4e99d67f7ac73fda1ba6e580fe4229a34b556853c028357225a0d5a5ffb40`
 
 
 ## 1. 中文禁止修改（中文 → 英文）
@@ -452,4 +458,380 @@ Compare CCAM0 with ZXQ1 and keep `user_id` unchanged.
 
 ````text
 将CCAM0与ZXQ1比较,保持`user_id`不变.
+````
+
+
+## 25. 中文单符免译（中文 → 英文）
+
+原文：
+
+````text
+请保留 ～这个产品叫鹦鹉～，并解释安装步骤。
+````
+
+真实输出：
+
+````text
+Please retain 这个产品叫鹦鹉 and explain the installation steps.
+````
+
+
+## 26. 中文双符免译（中文 → 英文）
+
+原文：
+
+````text
+请解释这个项目，保留 ～～不要翻译这段内容～～。
+````
+
+真实输出：
+
+````text
+Please explain this project and keep 不要翻译这段内容.
+````
+
+
+## 27. 多行免译（中文 → 英文）
+
+原文：
+
+````text
+请解释 ～第一行保持中文
+第二行保留 user_id 和 `cargo test`～ 的用途。
+````
+
+真实输出：
+
+````text
+Please explain the use of 第一行保持中文
+第二行保留 user_id 和 `cargo test`.
+````
+
+
+## 28. 多段免译与代码和链接（中文 → 英文）
+
+原文：
+
+````text
+保留 ～产品名称～ 和 ～～精确中文说明～～，检查 `src/main.rs` 并参考 https://example.test/docs。
+````
+
+真实输出：
+
+````text
+Keep 产品名称 and 精确中文说明, check `src/main.rs` and refer to https://example.test/docs。
+````
+
+
+## 29. 未闭合单符保护至末尾（中文 → 英文）
+
+原文：
+
+````text
+请解释这个项目。～后续不翻译
+包括 `main.rs` 和最后一行。
+````
+
+真实输出：
+
+````text
+Please explain this project.后续不翻译
+包括 `main.rs` 和最后一行。
+````
+
+
+## 30. 未闭合双符保护至末尾（英文 → 中文）
+
+原文：
+
+````text
+Explain the project. ～～Keep this exact English.
+Do not translate the remaining text.
+````
+
+真实输出：
+
+````text
+解释一下项目 Keep this exact English.
+Do not translate the remaining text.
+````
+
+
+## 31. 代码中的孤立全角符不影响后文（中文 → 英文）
+
+原文：
+
+````text
+```rust
+let label = "～不闭合";
+let id = "CCAM0 ZXQ1";
+```
+请解释这个函数，不要修改文件。
+````
+
+真实输出：
+
+````text
+```rust
+let label = "～不闭合";
+let id = "CCAM0 ZXQ1";
+```
+Please explain this function and do not modify the file.
+````
+
+
+## 32. 表格内免译与竖线（中文 → 英文）
+
+原文：
+
+````text
+| 内容 | 状态 |
+| --- | --- |
+| ～甲|乙～ | 需要检查 |
+````
+
+真实输出：
+
+````text
+| Contents | Status |
+| --- | --- |
+| 甲|乙 | Needs check |
+````
+
+
+## 33. 免译内原占位符和标识符（英文 → 中文）
+
+原文：
+
+````text
+Keep ～CCAM0 ZXQ1 `user_id`～ unchanged and explain the steps.
+````
+
+真实输出：
+
+````text
+保持CCAM0 ZXQ1 `user_id`不变并解释步骤.
+````
+
+
+## 34. 紧邻正文与连续免译段（英文 → 中文）
+
+原文：
+
+````text
+Keep～甲～～乙～and～～丙～～unchanged.
+````
+
+真实输出：
+
+````text
+保持甲 乙和丙不变.
+````
+
+
+## 35. 整段免译仅去除外层标记（中文 → 英文）
+
+原文：
+
+````text
+～～中文无需翻译
+English stays exact.
+`cargo test`～～
+````
+
+真实输出：
+
+````text
+中文无需翻译
+English stays exact.
+`cargo test`
+````
+
+
+## 36. 中文说明保留英文项目名（中文 → 英文）
+
+原文：
+
+````text
+请分析 ～parrot-ai-server-rust～ 项目，不要修改文件。
+````
+
+真实输出：
+
+````text
+Please analyse parrot-ai-server-rust items and do not modify files.
+````
+
+
+## 37. 英文说明保留英文项目名（英文 → 中文）
+
+原文：
+
+````text
+Explain ～parrot-ai-server-rust～ without changing its files.
+````
+
+真实输出：
+
+````text
+解释parrot-ai-server-rust而不更改其文件.
+````
+
+
+## 38. 仅英文项目名免译（中文 → 英文）
+
+原文：
+
+````text
+～parrot-ai-server-rust～
+````
+
+真实输出：
+
+````text
+parrot-ai-server-rust
+````
+
+
+## 39. 英文正文只剥离双层标记（中文 → 英文）
+
+原文：
+
+````text
+  Inspect ～～parrot-ai-server-rust～～ only.
+````
+
+真实输出：
+
+````text
+  Inspect parrot-ai-server-rust only.
+````
+
+
+## 40. 代码中的符号保留、项目名的符号移除（中文 → 英文）
+
+原文：
+
+````text
+Read `～literal～` in ～parrot-ai-server-rust～.
+````
+
+真实输出：
+
+````text
+Read `～literal～` in parrot-ai-server-rust.
+````
+
+
+## 41. 反向纯免译英文项目名（英文 → 中文）
+
+原文：
+
+````text
+～～parrot-ai-server-rust～～
+````
+
+真实输出：
+
+````text
+parrot-ai-server-rust
+````
+
+
+## 42. 长技术回复：表格与大量代码标识符（英文 → 中文）
+
+原文：
+
+````text
+# Review summary
+
+| Component | Status |
+| --- | --- |
+| `module_0.rs` | Check the changes in `commit_0` before deployment. |
+| `module_1.rs` | Check the changes in `commit_1` before deployment. |
+| `module_2.rs` | Check the changes in `commit_2` before deployment. |
+| `module_3.rs` | Check the changes in `commit_3` before deployment. |
+| `module_4.rs` | Check the changes in `commit_4` before deployment. |
+| `module_5.rs` | Check the changes in `commit_5` before deployment. |
+| `module_6.rs` | Check the changes in `commit_6` before deployment. |
+| `module_7.rs` | Check the changes in `commit_7` before deployment. |
+| `module_8.rs` | Check the changes in `commit_8` before deployment. |
+| `module_9.rs` | Check the changes in `commit_9` before deployment. |
+| `module_10.rs` | Check the changes in `commit_10` before deployment. |
+| `module_11.rs` | Check the changes in `commit_11` before deployment. |
+| `module_12.rs` | Check the changes in `commit_12` before deployment. |
+| `module_13.rs` | Check the changes in `commit_13` before deployment. |
+| `module_14.rs` | Check the changes in `commit_14` before deployment. |
+| `module_15.rs` | Check the changes in `commit_15` before deployment. |
+
+## Next steps
+
+- Inspect `src/module_0.rs`, run `cargo test module_0`, and keep configuration unchanged.
+- Inspect `src/module_1.rs`, run `cargo test module_1`, and keep configuration unchanged.
+- Inspect `src/module_2.rs`, run `cargo test module_2`, and keep configuration unchanged.
+- Inspect `src/module_3.rs`, run `cargo test module_3`, and keep configuration unchanged.
+- Inspect `src/module_4.rs`, run `cargo test module_4`, and keep configuration unchanged.
+- Inspect `src/module_5.rs`, run `cargo test module_5`, and keep configuration unchanged.
+- Inspect `src/module_6.rs`, run `cargo test module_6`, and keep configuration unchanged.
+- Inspect `src/module_7.rs`, run `cargo test module_7`, and keep configuration unchanged.
+- Inspect `src/module_8.rs`, run `cargo test module_8`, and keep configuration unchanged.
+- Inspect `src/module_9.rs`, run `cargo test module_9`, and keep configuration unchanged.
+- Inspect `src/module_10.rs`, run `cargo test module_10`, and keep configuration unchanged.
+- Inspect `src/module_11.rs`, run `cargo test module_11`, and keep configuration unchanged.
+- Inspect `src/module_12.rs`, run `cargo test module_12`, and keep configuration unchanged.
+- Inspect `src/module_13.rs`, run `cargo test module_13`, and keep configuration unchanged.
+- Inspect `src/module_14.rs`, run `cargo test module_14`, and keep configuration unchanged.
+- Inspect `src/module_15.rs`, run `cargo test module_15`, and keep configuration unchanged.
+
+```rust
+fn main() { println!("hello"); }
+```
+````
+
+真实输出：
+
+````text
+# 审查摘要
+
+| 构成部分 | 状态 |
+| --- | --- |
+| `module_0.rs` | 部署前请检查`commit_0`的变化. |
+| `module_1.rs` | 部署前请检查`commit_1`的变化. |
+| `module_2.rs` | 在部署前检查`commit_2`的变化. |
+| `module_3.rs` | 部署前请检查`commit_3`的变化. |
+| `module_4.rs` | 部署前请检查`commit_4`的变化. |
+| `module_5.rs` | 部署前请检查`commit_5`的变化. |
+| `module_6.rs` | 在部署前检查`commit_6`的变化. |
+| `module_7.rs` | 部署前请检查`commit_7`的变化. |
+| `module_8.rs` | 部署前请检查`commit_8`的变化. |
+| `module_9.rs` | 部署前请检查`commit_9`中的变化. |
+| `module_10.rs` | 部署前请检查`commit_10`的变化. |
+| `module_11.rs` | 部署前请检查`commit_11`的变化. |
+| `module_12.rs` | 在部署前检查`commit_12`的变化. |
+| `module_13.rs` | 部署前请检查`commit_13`的变化. |
+| `module_14.rs` | 部署前请检查`commit_14`的变化. |
+| `module_15.rs` | 部署前请检查`commit_15`的变化. |
+
+## 今后的步骤
+
+- 检查`src/module_0.rs`,运行`cargo test module_0`,配置不变.
+- 检查`src/module_1.rs`,运行`cargo test module_1`,配置不变.
+- 检查`src/module_2.rs`,运行`cargo test module_2`,配置不变.
+- 检查`src/module_3.rs`,运行`cargo test module_3`,配置不变.
+- 检查`src/module_4.rs`,运行`cargo test module_4`,配置不变.
+- 检查`src/module_5.rs`,运行`cargo test module_5`,配置不变.
+- 检查`src/module_6.rs`,运行`cargo test module_6`,配置不变.
+- 检查`src/module_7.rs`,运行`cargo test module_7`,配置不变.
+- 检查`src/module_8.rs`,运行`cargo test module_8`,配置不变.
+- 检查`src/module_9.rs`,运行`cargo test module_9`,保持配置不变.
+- 检查`src/module_10.rs`,运行`cargo test module_10`,配置不变.
+- 检查`src/module_11.rs`,运行`cargo test module_11`,保持配置不变.
+- 检查`src/module_12.rs`,运行`cargo test module_12`,配置不变.
+- 检查`src/module_13.rs`,运行`cargo test module_13`,配置不变.
+- 检查`src/module_14.rs`,运行`cargo test module_14`,配置不变.
+- 检查`src/module_15.rs`,运行`cargo test module_15`,配置不变.
+
+```rust
+fn main() { println!("hello"); }
+```
 ````

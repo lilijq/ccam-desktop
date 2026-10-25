@@ -1,9 +1,36 @@
 import AppKit
 
+
 enum WorkspaceSplitAxis: String, Codable {
     case right, down
     var title: String { self == .right ? "左右分屏" : "上下分屏" }
     var symbol: String { self == .right ? "rectangle.split.2x1" : "rectangle.split.1x2" }
+}
+
+/// Center swaps existing slots; edges insert the moving pane beside its target.
+enum WorkspacePaneDropPosition: String, CaseIterable {
+    case left, right, top, bottom, center
+    var title: String {
+        switch self { case .left: return "左侧"; case .right: return "右侧"; case .top: return "上方"; case .bottom: return "下方"; case .center: return "交换位置" }
+    }
+    static func at(_ point: NSPoint, in bounds: NSRect) -> Self? {
+        guard bounds.width > 0, bounds.height > 0, bounds.contains(point) else { return nil }
+        let x = (point.x - bounds.minX) / bounds.width, y = (point.y - bounds.minY) / bounds.height
+        let distances: [(Self, CGFloat)] = [(.left, x), (.right, 1 - x), (.top, 1 - y), (.bottom, y)]
+        guard let nearest = distances.min(by: { $0.1 < $1.1 }), nearest.1 < 0.26 else { return .center }
+        return nearest.0
+    }
+    func preview(in bounds: NSRect) -> NSRect {
+        var rect = bounds.insetBy(dx: 6, dy: 6)
+        switch self {
+        case .left: rect.size.width /= 2
+        case .right: rect.size.width /= 2; rect.origin.x += rect.width
+        case .top: rect.size.height /= 2; rect.origin.y += rect.height
+        case .bottom: rect.size.height /= 2
+        case .center: break
+        }
+        return rect
+    }
 }
 
 /// A section is mounted once. Layout changes never own, clone or stop its task.
@@ -25,7 +52,7 @@ indirect enum WorkspacePaneNode: Codable, Equatable {
         case .pane: return NSSize(width: 340, height: 280)
         case .split(_, let axis, _, let a, let b):
             let first = a.minimumSize, second = b.minimumSize
-            return axis == .right ? NSSize(width: first.width + second.width + 7, height: max(first.height, second.height)) : NSSize(width: max(first.width, second.width), height: first.height + second.height + 7)
+            return axis == .right ? NSSize(width: first.width + second.width + 8, height: max(first.height, second.height)) : NSSize(width: max(first.width, second.width), height: first.height + second.height + 8)
         }
     }
     func replacing(_ section: Int, with replacement: WorkspacePaneNode) -> WorkspacePaneNode {
@@ -44,6 +71,13 @@ indirect enum WorkspacePaneNode: Codable, Equatable {
             return first ?? second
         }
     }
+    func swapping(_ first: Int, _ second: Int) -> WorkspacePaneNode {
+        switch self {
+        case .pane(let section): return .pane(section == first ? second : section == second ? first : section)
+        case .split(let id, let axis, let ratio, let a, let b):
+            return .split(id: id, axis: axis, ratio: ratio, first: a.swapping(first, second), second: b.swapping(first, second))
+        }
+    }
     func settingRatio(_ value: Double, for target: UUID) -> WorkspacePaneNode {
         switch self {
         case .pane: return self
@@ -54,7 +88,7 @@ indirect enum WorkspacePaneNode: Codable, Equatable {
     private func valid(depth: Int) -> Bool {
         guard depth <= 3 else { return false }
         switch self {
-        case .pane(let section): return (0...3).contains(section)
+        case .pane(let section): return (0...4095).contains(section)
         case .split(_, _, let ratio, let a, let b): return ratio.isFinite && (0.05...0.95).contains(ratio) && a.valid(depth: depth + 1) && b.valid(depth: depth + 1)
         }
     }
@@ -64,14 +98,44 @@ indirect enum WorkspacePaneNode: Codable, Equatable {
 struct WorkspacePaneLayout: Codable, Equatable {
     var root: WorkspacePaneNode = .pane(0)
     var active: Int = 0
-    var isValid: Bool { root.isValid && root.sections.contains(active) }
+    /// 0 is the legacy chat slot; 1...4 stay singleton tools. Further slots are
+    /// conversation identities, never extra copies of the tool runtimes.
+    var conversationIDs: [Int: String] = [:]
+    init(root: WorkspacePaneNode = .pane(0), active: Int = 0, conversationIDs: [Int: String] = [:]) {
+        self.root = root; self.active = active; self.conversationIDs = conversationIDs
+    }
+    private enum CodingKeys: String, CodingKey { case root, active, conversationIDs }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        root = try container.decode(WorkspacePaneNode.self, forKey: .root)
+        active = try container.decode(Int.self, forKey: .active)
+        conversationIDs = try container.decodeIfPresent([Int: String].self, forKey: .conversationIDs) ?? [:]
+    }
+    static func isChat(_ pane: Int) -> Bool { pane == 0 || pane >= 5 }
+    var isValid: Bool {
+        root.isValid && root.sections.contains(active) && conversationIDs.count <= 64
+            && conversationIDs.allSatisfy { (0...4095).contains($0.key) && Self.isChat($0.key) && !$0.value.isEmpty && $0.value.count <= 256 }
+            && root.sections.filter { $0 >= 5 }.allSatisfy { conversationIDs[$0] != nil }
+            && Set(root.sections.compactMap { conversationIDs[$0] }).count == root.sections.compactMap { conversationIDs[$0] }.count
+    }
+    func pane(for conversationID: String) -> Int? {
+        root.sections.first { conversationIDs[$0] == conversationID }
+            ?? conversationIDs.first(where: { $0.value == conversationID })?.key
+    }
+    mutating func bind(_ conversationID: String, to pane: Int) {
+        guard Self.isChat(pane), !conversationID.isEmpty else { return }
+        for (key, value) in conversationIDs where value == conversationID && key != pane && !root.sections.contains(key) { conversationIDs.removeValue(forKey: key) }
+        conversationIDs[pane] = conversationID
+    }
+    mutating func trimBindings() { conversationIDs = conversationIDs.filter { $0.key == 0 || root.sections.contains($0.key) } }
+    func availableChatSlot() -> Int { !root.sections.contains(0) ? 0 : (5...4095).first { !root.sections.contains($0) } ?? 5 }
     mutating func select(_ section: Int) {
-        guard (0...3).contains(section) else { return }
+        guard (0...4).contains(section) || conversationIDs[section] != nil else { return }
         if !root.sections.contains(section) { root = root.replacing(active, with: .pane(section)) }
         active = section
     }
     @discardableResult mutating func split(adding section: Int, axis: WorkspaceSplitAxis) -> Bool {
-        guard (0...3).contains(section), !root.sections.contains(section), root.sections.count < 4 else { return false }
+        guard ((0...4).contains(section) || conversationIDs[section] != nil), !root.sections.contains(section), root.sections.count < 4 else { return false }
         root = root.replacing(active, with: .split(id: UUID(), axis: axis, ratio: 0.5, first: .pane(active), second: .pane(section)))
         active = section; return true
     }
@@ -80,6 +144,23 @@ struct WorkspacePaneLayout: Codable, Equatable {
         root = next
         if active == section { active = next.sections.first ?? 0 }
         return true
+    }
+    /// Validate the complete result before committing, so rejected drags are no-ops.
+    @discardableResult mutating func move(_ section: Int, relativeTo target: Int, position: WorkspacePaneDropPosition) -> Bool {
+        guard isValid, section != target, root.sections.contains(section), root.sections.contains(target) else { return false }
+        let next: WorkspacePaneNode
+        if position == .center { next = root.swapping(section, target) }
+        else {
+            guard let remaining = root.removing(section) else { return false }
+            let axis: WorkspaceSplitAxis = position == .left || position == .right ? .right : .down
+            let sourceFirst = position == .left || position == .top
+            let pair = WorkspacePaneNode.split(id: UUID(), axis: axis, ratio: 0.5,
+                first: .pane(sourceFirst ? section : target), second: .pane(sourceFirst ? target : section))
+            next = remaining.replacing(target, with: pair)
+        }
+        let candidate = Self(root: next, active: section, conversationIDs: conversationIDs)
+        guard candidate.isValid else { return false }
+        self = candidate; return true
     }
     static func load(projectID: UUID) -> WorkspacePaneLayout {
         guard let data = UserDefaults.standard.data(forKey: key(projectID)), data.count < 16_384,
@@ -127,7 +208,7 @@ final class WorkspaceDividerView: NSSplitView, NSSplitViewDelegate {
     private var applying = false
     var onRatioChange: ((UUID, Double) -> Void)?
     override var isFlipped: Bool { true }
-    override var dividerThickness: CGFloat { 7 }
+    override var dividerThickness: CGFloat { 8 }
     init(id: UUID, axis: WorkspaceSplitAxis, ratio: Double, first: NSView, second: NSView, firstMinimum: NSSize, secondMinimum: NSSize) {
         splitID = id; self.ratio = ratio; self.firstMinimum = firstMinimum; self.secondMinimum = secondMinimum
         super.init(frame: .zero)
@@ -137,10 +218,7 @@ final class WorkspaceDividerView: NSSplitView, NSSplitViewDelegate {
     }
     required init?(coder: NSCoder) { fatalError() }
     override func drawDivider(in rect: NSRect) {
-        Theme.background.setFill(); rect.fill()
-        Theme.border.setFill()
-        let line = isVertical ? NSRect(x: rect.midX - 0.5, y: rect.minY, width: 1, height: rect.height) : NSRect(x: rect.minX, y: rect.midY - 0.5, width: rect.width, height: 1)
-        line.fill()
+        Theme.workspaceCanvas.setFill(); rect.fill()
     }
     override func resizeSubviews(withOldSize oldSize: NSSize) {
         guard subviews.count == 2 else { return }
@@ -175,54 +253,173 @@ final class WorkspaceDividerView: NSSplitView, NSSplitViewDelegate {
     }
 }
 
-final class WorkspacePaneView: NSView {
+/// Window-local dragging deliberately uses event coordinates. No file pasteboard
+/// or system drag session is involved; a pane only moves inside its workspace.
+final class WorkspacePaneHeader: ThemeSurface {
     let section: Int
-    private let header = ThemeSurface(Theme.panel)
-    private let picker = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let titleRule = ThemeSurface(Theme.border)
-    var onSelect: ((Int) -> Void)?
-    var onSplit: ((WorkspaceSplitAxis, NSView) -> Void)?
-    var onMaximize: (() -> Void)?
-    var onClose: (() -> Void)?
+    let title: String
+    var context: UUID?
+    var onDragChanged: ((WorkspacePaneHeader, NSPoint) -> Void)?
+    var onDragEnded: ((WorkspacePaneHeader, NSPoint) -> Void)?
+    var onDragCancelled: (() -> Void)?
+    private var dragMonitor: Any?
+    private var startLocation: NSPoint?
+    private var startWindowFrame: NSRect?
+    private var didDrag = false
+    init(section: Int, title: String) {
+        self.section = section; self.title = title
+        super.init(Theme.workspacePanel)
+        toolTip = "拖动排列窗格；边缘分屏，中间交换"
+        setAccessibilityLabel("拖动窗格：" + title)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    deinit { if let dragMonitor { NSEvent.removeMonitor(dragMonitor) } }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        // Controls keep normal click/keyboard behavior; blank header space drags.
+        var candidate = hit
+        while let view = candidate, view !== self {
+            if view is NSButton { return hit }
+            candidate = view.superview
+        }
+        return hit == nil ? nil : self
+    }
+    override func resetCursorRects() { super.resetCursorRects(); addCursorRect(bounds, cursor: .openHand) }
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if window !== newWindow { cancelDrag() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+    override func mouseDown(with event: NSEvent) {
+        cancelDrag()
+        guard window != nil, context != nil else { return }
+        startLocation = event.locationInWindow; startWindowFrame = window?.frame
+        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp, .keyDown]) { [weak self] event in
+            guard let self, let start = self.startLocation else { return event }
+            if event.type == .keyDown {
+                if event.keyCode == 53 { self.cancelDrag(); return nil }
+                return event
+            }
+            guard event.window === self.window, self.window?.frame == self.startWindowFrame else { self.cancelDrag(); return event }
+            let point = event.locationInWindow
+            if event.type == .leftMouseDragged {
+                if !self.didDrag, hypot(point.x - start.x, point.y - start.y) < 4 { return nil }
+                self.didDrag = true; self.onDragChanged?(self, point); return nil
+            }
+            let moved = self.didDrag
+            self.endTracking()
+            if moved { self.onDragEnded?(self, point) }
+            else { self.onDragCancelled?() }
+            return nil
+        }
+    }
+    // The monitor retains the press target even when the pointer crosses a
+    // browser, text editor or another panel, without giving those views a drop.
+    override func mouseDragged(with event: NSEvent) { }
+    override func mouseUp(with event: NSEvent) { cancelDrag() }
+    func cancelDrag() {
+        let wasTracking = startLocation != nil
+        endTracking()
+        if wasTracking { onDragCancelled?() }
+    }
+    private func endTracking() {
+        if let dragMonitor { NSEvent.removeMonitor(dragMonitor); self.dragMonitor = nil }
+        startLocation = nil; startWindowFrame = nil; didDrag = false
+    }
+}
+
+/// Draw the six-dot handle directly so it stays legible on every supported
+/// macOS version, without relying on an optional SF Symbols catalog entry.
+final class WorkspacePaneDragHandle: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        identifier = NSUserInterfaceItemIdentifier("paneDragHandle")
+        toolTip = "拖动窗格；边缘分屏，中间交换"
+        setAccessibilityLabel("窗格拖动柄")
+        setAccessibilityRole(.image)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.muted.withAlphaComponent(0.7).setFill()
+        for x in [-2.5, 2.5] {
+            for y in [-5.0, 0.0, 5.0] {
+                NSBezierPath(ovalIn: NSRect(x: bounds.midX + x - 1.25, y: bounds.midY + y - 1.25, width: 2.5, height: 2.5)).fill()
+            }
+        }
+    }
+}
+
+private final class WorkspaceDropPreview: NSView {
+    var position: WorkspacePaneDropPosition? { didSet { needsDisplay = true } }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        guard let position else { return }
+        let rect = position.preview(in: bounds)
+        Theme.text.withAlphaComponent(0.10).setFill(); NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
+        Theme.text.withAlphaComponent(0.65).setStroke(); let border = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8); border.lineWidth = 1.5; border.stroke()
+        let text = NSAttributedString(string: position == .center ? "交换位置" : "移到" + position.title,
+            attributes: [.font: Theme.font(size: 12, weight: .medium), .foregroundColor: Theme.text])
+        let size = text.size(), center = NSRect(x: rect.midX - size.width / 2 - 10, y: rect.midY - size.height / 2 - 6, width: size.width + 20, height: size.height + 12)
+        Theme.panel.setFill(); NSBezierPath(roundedRect: center, xRadius: 6, yRadius: 6).fill()
+        text.draw(at: NSPoint(x: center.minX + 10, y: center.minY + 6))
+    }
+}
+
+final class WorkspacePaneView: ThemeSurface {
+    /// A stable layout slot, not a content type; several slots may show chat.
+    let section: Int
+    let header: WorkspacePaneHeader
+    private let titleLabel = label("", size: 13, weight: .semibold)
+    private let more = WorkspacePaneButton(symbol: "ellipsis", title: "窗格操作")
+    private let preview = WorkspaceDropPreview()
+    var dragContext: UUID? { didSet { header.context = dragContext } }
+    var onMenu: ((NSView) -> Void)?
     var active = false { didSet {
-        titleRule.surfaceColor = active ? Theme.muted : Theme.border
-        picker.contentTintColor = active ? Theme.text : Theme.muted
-        picker.selectItem(at: section)
+        strokeColor = active ? Theme.muted.withAlphaComponent(0.45) : Theme.workspaceBorder
+        titleLabel.textColor = active ? Theme.text : Theme.muted
     } }
-    init(section: Int, title: String, content: NSView, headers: Bool, maximized: Bool) {
-        self.section = section
-        super.init(frame: .zero)
+    init(section: Int, title: String, content: NSView, headers: Bool, maximized: Bool, multiple: Bool = true) {
+        self.section = section; header = WorkspacePaneHeader(section: section, title: title)
+        super.init(Theme.background, border: Theme.workspaceBorder, radius: 12)
+        layer?.masksToBounds = true
         setAccessibilityLabel(title + "窗格")
         content.translatesAutoresizingMaskIntoConstraints = false; addSubview(content)
         let contentTop: NSLayoutYAxisAnchor
         if headers {
             header.translatesAutoresizingMaskIntoConstraints = false; addSubview(header)
-            picker.addItems(withTitles: ["对话", "文件", "Git", "终端"]); picker.selectItem(at: section)
-            picker.font = Theme.font(size: 12, weight: .medium); picker.isBordered = false; picker.bezelStyle = .regularSquare
-            picker.target = self; picker.action = #selector(picked); picker.setAccessibilityLabel("窗格内容：" + title)
-            picker.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            let right = WorkspacePaneButton(symbol: WorkspaceSplitAxis.right.symbol, title: "在右侧分屏：" + title)
-            let down = WorkspacePaneButton(symbol: WorkspaceSplitAxis.down.symbol, title: "在下方分屏：" + title)
-            let maximize = WorkspacePaneButton(symbol: maximized ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right", title: maximized ? "恢复分屏" : "放大窗格：" + title)
-            let close = WorkspacePaneButton(symbol: "xmark", title: "关闭窗格：" + title)
-            right.invoke = { [weak self, weak right] in guard let right else { return }; self?.onSplit?(.right, right) }
-            down.invoke = { [weak self, weak down] in guard let down else { return }; self?.onSplit?(.down, down) }
-            maximize.invoke = { [weak self] in self?.onMaximize?() }; close.invoke = { [weak self] in self?.onClose?() }
-            let controls = row([picker, spacer(), right, down, maximize, close], spacing: 2)
+            titleLabel.stringValue = title; titleLabel.lineBreakMode = .byTruncatingTail
+            titleLabel.maximumNumberOfLines = 1; titleLabel.toolTip = title
+            titleLabel.setAccessibilityLabel("窗格标题")
+            titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let grip = WorkspacePaneDragHandle(frame: .zero)
+            grip.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([grip.widthAnchor.constraint(equalToConstant: 32), grip.heightAnchor.constraint(equalToConstant: 32)])
+            more.setAccessibilityLabel("窗格操作：" + title); more.toolTip = "窗格操作"
+            more.invoke = { [weak self, weak more] in guard let more else { return }; self?.onMenu?(more) }
+            let controls = row([grip, titleLabel, spacer(), more], spacing: 4)
             controls.translatesAutoresizingMaskIntoConstraints = false; header.addSubview(controls)
-            titleRule.translatesAutoresizingMaskIntoConstraints = false; header.addSubview(titleRule)
             NSLayoutConstraint.activate([
-                header.topAnchor.constraint(equalTo: topAnchor), header.leadingAnchor.constraint(equalTo: leadingAnchor), header.trailingAnchor.constraint(equalTo: trailingAnchor), header.heightAnchor.constraint(equalToConstant: 32),
-                controls.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 6), controls.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -3), controls.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-                picker.widthAnchor.constraint(greaterThanOrEqualToConstant: 58),
-                titleRule.bottomAnchor.constraint(equalTo: header.bottomAnchor), titleRule.leadingAnchor.constraint(equalTo: header.leadingAnchor), titleRule.trailingAnchor.constraint(equalTo: header.trailingAnchor), titleRule.heightAnchor.constraint(equalToConstant: 1)
+                header.topAnchor.constraint(equalTo: topAnchor, constant: 1), header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 1), header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -1), header.heightAnchor.constraint(equalToConstant: 42),
+                controls.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 4), controls.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -7), controls.centerYAnchor.constraint(equalTo: header.centerYAnchor)
             ])
             contentTop = header.bottomAnchor
         } else { contentTop = topAnchor }
         NSLayoutConstraint.activate([
-            content.topAnchor.constraint(equalTo: contentTop, constant: headers ? 6 : 0), content.leadingAnchor.constraint(equalTo: leadingAnchor), content.trailingAnchor.constraint(equalTo: trailingAnchor), content.bottomAnchor.constraint(equalTo: bottomAnchor)
+            content.topAnchor.constraint(equalTo: contentTop, constant: headers ? 1 : 0), content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 1), content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -1), content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1)
         ])
+        preview.frame = bounds; preview.autoresizingMask = [.width, .height]; addSubview(preview)
     }
     required init?(coder: NSCoder) { fatalError() }
-    @objc private func picked() { onSelect?(picker.indexOfSelectedItem) }
+    func updateTitle(_ title: String) {
+        titleLabel.stringValue = title; titleLabel.toolTip = title
+        setAccessibilityLabel(title + "窗格"); more.setAccessibilityLabel("窗格操作：" + title)
+    }
+    func clearDropPreview() { preview.position = nil }
+    func showDropPreview(_ position: WorkspacePaneDropPosition) { preview.position = position }
+    func acceptsDrag(source: WorkspacePaneHeader) -> Bool {
+        guard let dragContext, source.context == dragContext, source.section != section,
+              source.window === window, source.window != nil else { return false }
+        return true
+    }
 }

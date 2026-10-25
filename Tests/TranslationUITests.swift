@@ -36,13 +36,20 @@ enum TranslationUITests {
         var settings = ChatOptions(model: "haiku", permissionMode: .default, effort: "low")
         settings.translateToEnglish = true; settings.autoTranslateReplies = false
         var first = ChatConversation(id: UUID().uuidString, title: "翻译与上下文", projectID: project.id.uuidString, directory: root.path, options: settings)
-        var user = ChatMessage(role: "user", text: "Explain the file tree.\n\nPlease respond in English.")
+        var user = ChatMessage(role: "user", text: "Explain the file tree.")
         user.originalText = "解释一下文件树。"
         let answer = ChatMessage(role: "assistant", text: "The file tree shows your project folders. Open `src/main.rs` to inspect the entry point.")
         first.messages = [user, answer]
         var second = ChatConversation(id: UUID().uuidString, title: "另一段对话", projectID: project.id.uuidString, directory: root.path, options: settings)
         second.messages = [ChatMessage(role: "user", text: "Explain the command."), ChatMessage(role: "assistant", text: "Run `git status` to see the working tree changes.")]
-        try ChatStore(project: project).save([first, second], selectedID: first.id)
+        var process = ChatConversation(id: UUID().uuidString, title: "执行过程折叠", projectID: project.id.uuidString, directory: root.path, options: settings)
+        process.messages = [ChatMessage(role: "user", text: "Review the code."),
+                            ChatMessage(role: "assistant", text: "I will inspect the files first."),
+                            ChatMessage(role: "tool", text: "private command output", toolName: "Bash"),
+                            ChatMessage(role: "assistant", text: "I found the entry point; inspecting dependencies."),
+                            ChatMessage(role: "tool", text: "file content", toolName: "Read"),
+                            ChatMessage(role: "assistant", text: "The review is complete.")]
+        try ChatStore(project: project).save([first, second, process], selectedID: first.id)
         let translator = ControlledTranslator()
         let view = ProjectChatView(project: project, translator: translator)
         view.beforeStart = { _ in throw AppError.message("Translation UI fixtures never start Claude") }
@@ -52,7 +59,11 @@ enum TranslationUITests {
         func button(_ label: String) -> NSButton? { all().compactMap { $0 as? NSButton }.first { $0.accessibilityLabel() == label } }
         let input = all().compactMap { $0 as? NSTextView }.first { $0.accessibilityLabel() == "对话输入" }!
         func draft(_ text: String) { input.string = text; view.textDidChange(Notification(name: NSText.didChangeNotification)) }
-        func textVisible(_ text: String) -> Bool { all().compactMap { $0 as? NSTextField }.contains { $0.stringValue == text } }
+        func textVisible(_ text: String) -> Bool {
+            let paragraphs = text.components(separatedBy: "\n\n").filter { !$0.isEmpty }.map { ChatMarkdown.inline($0).string }
+            let fields = all().compactMap { $0 as? NSTextField }.map(\.stringValue)
+            return !paragraphs.isEmpty && paragraphs.allSatisfy { fields.contains($0) }
+        }
         func preference(_ tag: Int) {
             let item = view.translationSettingsMenu().items.first { $0.tag == tag }!
             _ = NSApp.sendAction(item.action!, to: item.target, from: item)
@@ -60,10 +71,18 @@ enum TranslationUITests {
         func settle() {
             for _ in 0..<4 { view.layoutSubtreeIfNeeded(); RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
         }
+        let privateClipboard = NSPasteboard(name: NSPasteboard.Name("ccam-copy-test-" + UUID().uuidString))
+        let originalFixture = "## Original\n\n```rust\nfn main() { println!(\"hello\"); }\n```\n～keep_me～"
+        ChatOriginalCopy.write(originalFixture, to: privateClipboard)
+        if let copied = privateClipboard.string(forType: .string) {
+            check(copied == originalFixture, "copy original preserves complete Markdown, code, whitespace and no-translate text")
+        } // A restricted headless runner may not expose the macOS pasteboard service.
+        privateClipboard.releaseGlobally()
+        check(button("复制原文") != nil, "assistant reply exposes one-click original copy before translation")
         check(translator.jobs.isEmpty, "opening saved history never triggers automatic translation work")
         check(textVisible(user.originalText!) && !textVisible(user.text), "translated user prompt presents the original Chinese first")
         button("查看发送的英文")!.performClick(nil)
-        check(textVisible(user.text), "user can inspect the exact outbound English and language instruction")
+        check(textVisible(user.text), "user can inspect the exact outbound English without an added language instruction")
         button("收起发送的英文")!.performClick(nil)
         check(!textVisible(user.text), "outbound English can be collapsed without changing the transcript")
 
@@ -188,6 +207,14 @@ enum TranslationUITests {
         check(textVisible(second.messages.last!.text) && textVisible("运行 `git status` 查看工作区改动。") && translator.jobs.count == retryCalls,
               "switching a retried cached reply to automatic Chinese still reveals exact English without retranslating")
         button("收起英文原文")!.performClick(nil)
+        let beforeRetranslation = translator.jobs.count
+        button("重新翻译原文")!.performClick(nil)
+        check(translator.jobs.count == beforeRetranslation + 1 && translator.jobs.last!.text == second.messages.last!.text && button("复制原文")?.isEnabled == true, "retranslate uses original English and original copy stays available during translation")
+        translator.jobs.last!.completion(.failure(AppError.message("移动盘未连接")))
+        check(textVisible("运行 `git status` 查看工作区改动。") && textVisible("移动盘未连接"), "failed retranslation keeps the previous Chinese cache and original")
+        button("重新翻译原文")!.performClick(nil)
+        translator.jobs.last!.completion(.success("运行 `git status` 检查工作区。"))
+        check(textVisible("运行 `git status` 检查工作区。") && !textVisible("移动盘未连接"), "successful retranslation updates the cache without sending a model message")
         preference(0)
 
         let brief = root.appendingPathComponent("brief.md"), sample = root.appendingPathComponent("sample.rs")
@@ -240,6 +267,65 @@ enum TranslationUITests {
         preference(0)
         check(button("重试翻译")?.isHidden == true && input.string == "修改后的草稿。",
               "disabling outgoing translation hides its retry without losing the draft")
+        preference(0)
+        for markedName in ["～parrot-ai-server-rust～", "～～parrot-ai-server-rust～～"] {
+            draft(markedName)
+            let priorJobs = translator.jobs.count
+            button("发送消息")!.performClick(nil)
+            check(translator.jobs.count == priorJobs + 1 && translator.jobs.last?.text == markedName && view.hasRunning,
+                  "English-only protected names enter marker processing instead of bypassing it")
+            translator.jobs.last!.completion(.success("parrot-ai-server-rust"))
+            check(input.string == markedName && !view.hasRunning && button("重试翻译")?.isHidden == true,
+                  "a stripped English result uses the ordinary send path and launch failure restores the exact marked draft")
+        }
+        draft("parrot-ai-server-rust")
+        let unmarkedJobs = translator.jobs.count
+        button("发送消息")!.performClick(nil)
+        check(translator.jobs.count == unmarkedJobs && input.string == "parrot-ai-server-rust",
+              "an English project name without markers still bypasses local translation")
+        view.selectConversation(id: process.id); settle()
+        check(button("展开执行过程") != nil && button("展开执行项目操作") == nil, "a turn's tools collapse into one quiet process row")
+        check(textVisible("The review is complete.") && !textVisible("I will inspect the files first."), "final reply stays prominent while intermediate narration is collapsed")
+        button("展开执行过程")!.performClick(nil); settle()
+        check(button("展开执行项目操作") != nil && button("展开读取文件") != nil && textVisible("I will inspect the files first."), "expanding process restores intermediate text and tool controls without discarding content")
+        button("展开执行项目操作")!.performClick(nil)
+        check(textVisible("private command output"), "raw execution detail remains available on demand")
+        button("折叠执行过程")!.performClick(nil); settle()
+        check(!textVisible("private command output") && textVisible("The review is complete."), "collapsing again hides execution details only")
+        window.setContentSize(NSSize(width: 968, height: 720)); settle()
+        try ChatUITests.snapshot(view, name: "reply-focused-desktop")
+        let permissionCard = ChatApprovalCard(title: "执行项目操作", detail: "git status", actionTitle: "允许", canApprove: true, approve: {}, deny: {}, rememberTool: "Bash", approveRemembering: { _ in })
+        check(permissionCard.rememberChoice.state == .on && !permissionCard.rememberChoice.isHidden, "tool approval offers a visible project-scoped remembered choice")
+        let permissionWindow = TranslationFixtureWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 210), styleMask: [.titled], backing: .buffered, defer: false)
+        permissionWindow.contentView = permissionCard; permissionCard.layoutSubtreeIfNeeded()
+        try ChatUITests.snapshot(permissionCard, name: "remember-permission-compact")
+        let liveFixture = try ChatTests.Fixture("live-translation")
+        defer { liveFixture.clean() }
+        let liveTranslator = ControlledTranslator()
+        let liveView = ProjectChatView(project: liveFixture.project, translator: liveTranslator, controller: liveFixture.runtime)
+        let liveWindow = TranslationFixtureWindow(contentRect: NSRect(x: 0, y: 0, width: 968, height: 720), styleMask: [.titled], backing: .buffered, defer: false)
+        liveWindow.contentView = liveView
+        check(liveFixture.runtime.send(text: "Synthetic streaming fixture only"), "isolated fake Claude starts for live UI verification")
+        ChatTests.spin(6) { !liveTranslator.jobs.isEmpty }
+        check(liveFixture.runtime.hasRunning && liveTranslator.jobs.first?.text == "Inspect `main.rs` before deployment.\n\n", "the actual view requests translation before the simulated CLI finishes")
+        liveTranslator.jobs[0].completion(.success("部署前检查 `main.rs`。"))
+        let liveFields = ChatUITests.all(liveView).compactMap { $0 as? NSTextField }.map(\.stringValue)
+        check(liveFields.contains { $0.contains("部署前检查") } && !liveFields.contains { $0.contains("Inspect `main.rs`") }, "Chinese prose is displayed while the original reply is still streaming")
+        liveView.layoutSubtreeIfNeeded(); try ChatUITests.snapshot(liveView, name: "streaming-chinese-desktop")
+        var completedJobs = 1
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            while completedJobs < liveTranslator.jobs.count {
+                let job = liveTranslator.jobs[completedJobs]; completedJobs += 1
+                let text = job.text.replacingOccurrences(of: "Keep ～server-name～ unchanged.", with: "保持 server-name 不变。")
+                job.completion(.success(text))
+            }
+            if !liveFixture.runtime.hasRunning && liveFixture.runtime.currentMessages.last(where: { $0.role == "assistant" })?.translatedText != nil { break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        let liveReply = liveFixture.runtime.currentMessages.last { $0.role == "assistant" }
+        check(liveReply?.translatedText?.contains("```rust\nfn main() {}\n```") == true && liveReply?.translatedText?.contains("保持 server-name 不变。") == true, "live UI persists complete Chinese plus untouched code after the final chunk")
+        check(liveReply?.text.contains("Keep ～server-name～ unchanged.") == true && liveFixture.runtime.currentMessages.filter { $0.role == "assistant" }.count == 1, "streaming preserves exact original and never duplicates the final assistant block")
         check(!window.isVisible, "translation UI checks stay offscreen")
         return count
     }

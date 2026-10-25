@@ -3,7 +3,10 @@ import Darwin
 import ImageIO
 import UniformTypeIdentifiers
 
-@main enum ChatTests {
+#if !CHAT_UI_FIXTURES
+@main
+#endif
+enum ChatTests {
     static var checks = 0
     static func check(_ condition: @autoclosure () -> Bool, _ text: String) {
         guard condition() else { fputs("FAIL: \(text)\n", stderr); exit(1) }; checks += 1
@@ -151,10 +154,18 @@ if limited:
     unrelated=root/'unrelated.jsonl';unrelated.write_text('{}\n')
     note=root/'state/handoff/third/unrelated.json';note.parent.mkdir(parents=True,exist_ok=True);note.write_text(json.dumps({'account':'third','session_id':'unrelated','transcript_path':str(unrelated),'cwd':os.getcwd(),'reason':'limit','at':datetime.datetime.now(datetime.timezone.utc).isoformat()}))
     emit({'type':'result','subtype':'error_during_execution','is_error':True,'errors':['rate_limit']});sys.exit(1)
+if mode=='live-translation':
+    chunks=['Inspect `main.rs` before deployment.\n\n','```rust\nfn main()', ' {}\n```\n\n','Keep ～server-name～ unchanged.\n']
+    emit({'type':'stream_event','event':{'type':'message_start','message':{'id':'live'}}})
+    for chunk in chunks:
+        emit({'type':'stream_event','event':{'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':chunk}}})
+        time.sleep(.8)
+    emit({'type':'assistant','message':{'id':'live','content':[{'type':'text','text':''.join(chunks)}]}})
+    emit({'type':'result','subtype':'success','is_error':False});sys.exit(0)
 emit({'type':'stream_event','event':{'type':'message_start','message':{'id':'msg-'+sid}}})
 for index,text in [(0,'第一段完成'),(2,'第二段完成')]:
     emit({'type':'stream_event','event':{'type':'content_block_delta','index':index,'delta':{'type':'text_delta','text':text}}})
-    emit({'type':'assistant','message':{'id':'msg-'+sid,'content':[{'type':'text','text':text}]}})
+    emit({'type':'assistant','message':{'id':'msg-'+sid,'content':[{'type':'text','text':('更正后的正文' if mode=='corrected-final' and index==0 else text)}]}})
 emit({'type':'assistant','message':{'id':'msg-'+sid,'content':[{'type':'tool_use','id':'tool1','name':'Read','input':{'file_path':'a.txt'}}]}})
 emit({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'tool1','content':'fixture tool result'}]}})
 emit({'type':'result','subtype':'success','is_error':False,'result':'第二段完成','permission_denials':[{'tool_name':'Bash','tool_use_id':'denied','tool_input':{}}] if mode=='permission' else []})
@@ -163,8 +174,145 @@ if mode in ('approval-background','approval-duplicate'):assert sys.stdin.read()=
 """#
     }
 
+    static func multiConversationChecks() throws {
+        let f = try Fixture("slow"); defer { f.clean() }
+        let first = f.runtime.selectedID!, second = UUID().uuidString
+        var original = f.runtime.currentConversation!
+        let answer = ChatMessage(role: "assistant", text: "Original answer")
+        original.messages = [answer]
+        let other = ChatConversation(id: second, title: "Second", projectID: f.project.id.uuidString, directory: f.project.path)
+        try f.store.save([original, other], selectedID: first)
+        func store() throws -> ChatStore { try ChatStore(project: f.project, fileURL: f.store.fileURL) }
+        func index(_ values: [ChatConversation], _ id: String) -> Int { values.firstIndex { $0.id == id }! }
+        let left = try store(), right = try store()
+        var pending = left.conversations
+        let stream = ChatMessage(role: "assistant", text: "Pending stream")
+        pending[index(pending, first)].messages.append(stream)
+        var remote = right.conversations
+        remote[index(remote, first)].title = "Renamed elsewhere"
+        remote[index(remote, first)].messages[0].translatedText = "原回复译文"
+        remote[index(remote, first)].options = ChatOptions(autoTranslateReplies: false)
+        let attachment = ChatAttachment(id: "fixture-attachment", name: "fixture.txt", relativePath: "fixture/file", kind: .file, byteCount: 1, mediaType: nil, sha256: "fixture-only")
+        remote[index(remote, second)].draftAttachments = [attachment]
+        remote[index(remote, second)].messages.append(ChatMessage(role: "user", text: "Other pane"))
+        try right.save(remote, selectedID: second)
+        try left.save(pending, selectedID: first, preserveSelection: true)
+        var saved = try store()
+        check(saved.conversations[index(saved.conversations, first)].title == "Renamed elsewhere" && saved.selectedID == second,
+              "a stale stream save preserves another pane's rename and global selection")
+        check(saved.conversations[index(saved.conversations, first)].messages.map(\.id) == [answer.id, stream.id] && saved.conversations[index(saved.conversations, first)].messages[0].translatedText == "原回复译文",
+              "message-ID merging preserves pending output and another pane's translation")
+        check(saved.conversations[index(saved.conversations, second)].draftAttachments == [attachment] && saved.conversations[index(saved.conversations, second)].messages.count == 1,
+              "a sibling stream cannot overwrite another conversation's draft attachments or message")
+        pending = left.conversations
+        let pendingIndex = index(pending, first)
+        pending[pendingIndex].messages[pending[pendingIndex].messages.count - 1].text += " more"
+        try left.save(pending, selectedID: first, preserveSelection: true)
+        check(left.conversations[index(left.conversations, first)].title == "Renamed elsewhere", "adopting the merged baseline prevents a later save from reverting a remote rename")
+
+        let dirty = try store(), metadata = try store()
+        var dirtyValues = dirty.conversations
+        dirtyValues[index(dirtyValues, first)].messages[0].text = "Changed source"
+        var metadataValues = metadata.conversations
+        metadataValues[index(metadataValues, second)].title = "Fresh second title"
+        try metadata.save(metadataValues, selectedID: second)
+        dirtyValues = try dirty.rebase(dirtyValues)
+        check(dirtyValues[index(dirtyValues, first)].messages[0].text == "Changed source" && dirtyValues[index(dirtyValues, second)].title == "Fresh second title",
+              "notification rebasing preserves unsaved local stream text while importing other metadata")
+        try dirty.save(dirtyValues, selectedID: first, preserveSelection: true)
+        check(dirty.conversations[index(dirty.conversations, first)].messages[0].translatedText == nil,
+              "a translation tied to an older source is invalidated when stream text changes")
+
+        let stale = try store(), deleting = try store()
+        var staleValues = stale.conversations, deletedValues = deleting.conversations
+        deletedValues[index(deletedValues, first)].deletedAt = Date()
+        try deleting.save(deletedValues, selectedID: second)
+        staleValues[index(staleValues, first)].messages.append(ChatMessage(role: "notice", text: "Late stream flush"))
+        try stale.save(staleValues, selectedID: first, preserveSelection: true)
+        saved = try store()
+        check(saved.conversations[index(saved.conversations, first)].deletedAt != nil, "a stale stream flush cannot resurrect a deleted conversation")
+        do { _ = try ChatRuntime(project: f.project, conversationID: first, store: saved, environment: f.environment); check(false, "deleted binding must fail") }
+        catch { check(true, "opening a deleted binding never silently selects another conversation") }
+        do { _ = try ChatRuntime(project: f.project, conversationID: "missing", store: try store(), environment: f.environment); check(false, "missing binding must fail") }
+        catch { check(true, "opening a missing binding fails without creating a new conversation") }
+
+        let boundRight = try ChatRuntime(project: f.project, conversationID: second, store: try store(), environment: f.environment)
+        try boundRight.restoreConversation(id: first)
+        check(boundRight.selectedID == second && boundRight.currentConversation?.title == "Fresh second title", "restoring another conversation keeps the pane's immutable binding")
+        boundRight.select(id: first)
+        check(boundRight.selectedID == second && boundRight.createConversation() == nil, "bound runtimes cannot switch identity or create a hidden replacement conversation")
+
+        let permissionA = try store(), permissionB = try store()
+        try permissionA.remember(tool: "Bash"); try permissionB.remember(tool: "Read")
+        check(permissionA.refreshedRememberedTools() == ["Bash", "Read"], "independent permission stores union explicit remembered choices")
+        try permissionA.clearRememberedTools()
+        check(boundRight.rememberedTools.isEmpty && permissionB.refreshedRememberedTools().isEmpty, "cleared project permissions take effect in other runtimes before notifications run")
+        try permissionB.remember(tool: "Edit")
+        check(permissionA.refreshedRememberedTools() == ["Edit"], "a stale permission store cannot restore choices that were explicitly cleared")
+
+        let rollback = try store(), previous = rollback.conversations
+        let newID = try rollback.createConversation()
+        try rollback.save(previous, selectedID: first)
+        check(!rollback.conversations.contains { $0.id == newID }, "record rollback recognizes its unchanged save despite ISO8601 date precision")
+        let retainedID = try rollback.createConversation(), external = try store()
+        var externalValues = external.conversations
+        externalValues[index(externalValues, retainedID)].title = "External edit survives rollback"
+        try external.save(externalValues, selectedID: retainedID)
+        try rollback.save(previous, selectedID: first)
+        check(rollback.conversations.contains { $0.id == retainedID && $0.title == "External edit survives rollback" }, "record rollback cannot remove a conversation changed by another writer")
+        var invalid = rollback.conversations
+        invalid[index(invalid, first)].messages = [answer, answer]
+        do { try rollback.save(invalid, selectedID: first); check(false, "duplicate message IDs rejected") }
+        catch { check(true, "duplicate message IDs produce an error instead of a dictionary trap") }
+
+        let blocked = try ChatRuntime(project: f.project, conversationID: first, store: try store(),
+                                      ccamExecutable: f.root.appendingPathComponent("missing-launcher").path,
+                                      helperExecutable: CommandLine.arguments[0], environment: f.environment)
+        let beforeBlockedMessages = blocked.currentMessages
+        blocked.beforeStart = { _ in
+            let concurrent = try store(); var values = concurrent.conversations
+            values[index(values, first)].title = "Rename during failed launch"
+            try concurrent.save(values, selectedID: second)
+        }
+        check(!blocked.send(text: "rejected local turn"), "a missing launcher cannot accept the proposed turn")
+        check(blocked.currentConversation?.title == "Rename during failed launch" && blocked.currentMessages == beforeBlockedMessages,
+              "failed launch rollback removes only its own prompt and preserves an interleaved external rename")
+
+        // Only the fixture fake executable is reachable; no real Claude request.
+        let leftRuntime = try ChatRuntime(project: f.project, conversationID: first, store: try store(), ccamExecutable: f.native,
+                                          helperExecutable: CommandLine.arguments[0], environment: f.environment, retryInterval: 0.15, maximumWait: 10)
+        let rightRuntime = try ChatRuntime(project: f.project, conversationID: second, store: try store(), ccamExecutable: f.native,
+                                           helperExecutable: CommandLine.arguments[0], environment: f.environment, retryInterval: 0.15, maximumWait: 10)
+        // Remove a metadata-only attachment fixture before exercising execution.
+        try rightRuntime.setDraftAttachments([])
+        defer { leftRuntime.stop(); rightRuntime.stop(); spin(5) { !leftRuntime.hasRunning && !rightRuntime.hasRunning } }
+        check(leftRuntime.send(text: "parallel left") && rightRuntime.send(text: "parallel right"), "two bound conversations can start independent isolated fake turns")
+        spin { leftRuntime.currentMessages.contains { $0.text == "Working" } && rightRuntime.currentMessages.contains { $0.text == "Working" } }
+        check(leftRuntime.hasRunning && rightRuntime.hasRunning && leftRuntime.selectedID == first && rightRuntime.selectedID == second,
+              "simultaneous streams retain independent runtime state and fixed selections")
+        try rightRuntime.renameConversation(id: first, title: "Renamed during streaming")
+        try rightRuntime.saveTranslation(messageID: answer.id, sourceText: "Changed source", text: "并发译文")
+        leftRuntime.stop(); spin { !leftRuntime.hasRunning }
+        check(rightRuntime.hasRunning, "stopping one conversation leaves its sibling process running")
+        rightRuntime.stop(); spin { !rightRuntime.hasRunning }
+        saved = try store()
+        check(saved.conversations[index(saved.conversations, first)].title == "Renamed during streaming" && saved.conversations[index(saved.conversations, first)].messages.first { $0.id == answer.id }?.translatedText == "并发译文",
+              "stream completion preserves concurrent title and translation metadata")
+        check(saved.conversations[index(saved.conversations, first)].messages.contains { $0.text == "parallel left" } && saved.conversations[index(saved.conversations, second)].messages.contains { $0.text == "parallel right" },
+              "both concurrent transcripts survive final persistence")
+        try boundRight.deleteConversation(id: first)
+        leftRuntime.reloadConversationIndex()
+        check(leftRuntime.selectedID == first && leftRuntime.boundConversationUnavailable && !leftRuntime.send(text: "must not start"),
+              "deleted bound panes remain unavailable and cannot send into another conversation")
+        try boundRight.restoreConversation(id: first)
+        leftRuntime.reloadConversationIndex()
+        check(leftRuntime.selectedID == first && !leftRuntime.boundConversationUnavailable && leftRuntime.stateText == "继续这段对话",
+              "restoring a bound conversation also clears its stale deleted-state label")
+    }
+
     static func main() throws {
         if let code = GlobalPool.handleHelperInvocation() { exit(code) }
+        try multiConversationChecks()
         do {
             var parser = ChatStreamDecoder()
             let source = Data("launcher notice\n{\"type\":\"assistant\",\"text\":\"中文\"}\n{\"type\":\"result\"}".utf8)
@@ -191,15 +339,18 @@ if mode in ('approval-background','approval-duplicate'):assert sys.stdin.read()=
             check(decoded.options == nil && decoded.deletedAt == nil && decoded.id == originalID, "older conversation records decode without losing identity")
             do { try f.runtime.updateOptions(model: "--dangerous-option", permissionMode: .default); check(false, "invalid model rejected") } catch { check(f.runtime.currentOptions == options, "invalid model cannot partially change stored controls") }
             do { try f.runtime.updateOptions(model: "sonnet", permissionMode: .default, effort: "unknown"); check(false, "invalid effort rejected") } catch { check(f.runtime.currentOptions == options, "invalid effort cannot partially change controls") }
+            f.runtime.webMCPArguments = { ["--mcp-config", "/tmp/offline-project-web.json"] }
             f.send("first turn")
             check(f.runtime.currentConversation?.title == "模型与模式", "first send preserves an explicitly renamed title")
             let sid = f.runtime.currentConversation?.sessionID, account = f.runtime.currentConversation?.account
             func value(_ flag: String, in args: [String]) -> String? { args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
             let firstArgs = f.runs[0]["args"] as! [String]
+            check(value("--mcp-config", in: firstArgs) == "/tmp/offline-project-web.json", "project browser MCP reaches the CLI after the CCAM separator")
             check(value("--model", in: firstArgs) == "opus" && value("--permission-mode", in: firstArgs) == "plan" && value("--effort", in: firstArgs) == "high", "saved options reach the first real-CCAM / fake-Claude turn")
             try f.runtime.updateOptions(model: "haiku", permissionMode: .acceptEdits, effort: "low")
             f.send("same conversation")
             let nextArgs = f.runs[1]["args"] as! [String]
+            check(value("--mcp-config", in: nextArgs) == "/tmp/offline-project-web.json", "project browser MCP persists across resumed turns")
             check(value("--model", in: nextArgs) == "haiku" && value("--permission-mode", in: nextArgs) == "acceptEdits" && value("--effort", in: nextArgs) == "low", "changed options reach the following turn")
             check(f.runtime.currentConversation?.sessionID == sid && f.runtime.currentConversation?.account == account && f.runs[1]["sid"] as? String == sid, "changing model or mode keeps exact session, account and history")
             try f.runtime.updateOptions(model: nil, permissionMode: .default)
@@ -327,6 +478,11 @@ if mode in ('approval-background','approval-duplicate'):assert sys.stdin.read()=
             check(!f.runtime.needsTerminalInteraction && f.runtime.currentMessages.contains { $0.role == "notice" && $0.text.contains("权限规则拒绝") }, "policy denials are explained without forcing terminal takeover")
             check(!f.runtime.stateText.contains("已完成"), "blocked operations are not labeled completed")
         }
+        do {
+            let f = try Fixture("corrected-final"); defer { f.clean() }
+            f.send("verify final correction")
+            check(f.runtime.currentMessages.filter { $0.role == "assistant" }.map(\.text) == ["更正后的正文", "第二段完成"], "corrected final text replaces its streamed block without duplicating a message")
+        }
         for mode in ["approval", "approval-duplicate", "approval-background"] {
             let f = try Fixture(mode); defer { f.clean() }
             f.runtime.send(text: "check the repository")
@@ -341,6 +497,28 @@ if mode in ('approval-background','approval-duplicate'):assert sys.stdin.read()=
             check((result?["updatedInput"] as? [String: Any])?["command"] as? String == "git -C ./repo status --short", "\(mode) preserves exact approved arguments")
             check(!f.runtime.hasRunning && f.runtime.pendingApprovals.isEmpty && !f.runtime.needsTerminalInteraction, "\(mode) finishes and clears approval state")
             do { try f.runtime.approve(id: approval.id); check(false, "old approval rejected") } catch { check(f.replies.count == 1, "repeated click cannot send a second response") }
+        }
+        do {
+            let f = try Fixture("approval"); defer { f.clean() }
+            f.runtime.send(text: "remember this tool"); spin { !f.runtime.pendingApprovals.isEmpty }
+            try f.runtime.approve(id: f.runtime.pendingApprovals[0].id, remember: true)
+            spin { !f.runtime.hasRunning }
+            check(f.runtime.rememberedTools == ["Bash"], "explicit remembered approval saves only the chosen tool")
+            let reopened = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            check(reopened.rememberedTools == ["Bash"], "tool choice survives app restart")
+            f.send("same project next turn")
+            check(!f.runtime.hasRunning && f.runtime.pendingApprovals.isEmpty && f.replies.count == 2, "remembered project tool is automatically approved on a later turn")
+            f.runtime.send(text: "plan still requires approval", permissionMode: .plan); spin { !f.runtime.pendingApprovals.isEmpty }
+            check(!f.runtime.pendingApprovals.isEmpty, "remembered tool cannot override plan mode")
+            try f.runtime.deny(id: f.runtime.pendingApprovals[0].id); spin { !f.runtime.hasRunning }
+            try f.runtime.clearRememberedPermissions()
+            let cleared = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            check(cleared.rememberedTools.isEmpty, "clearing remembered permissions persists")
+            f.runtime.send(text: "ask again", permissionMode: .default); spin { !f.runtime.pendingApprovals.isEmpty }
+            check(!f.runtime.pendingApprovals.isEmpty, "cleared permissions ask again")
+            try f.runtime.deny(id: f.runtime.pendingApprovals[0].id); spin { !f.runtime.hasRunning }
+            let other = try Fixture("approval"); defer { other.clean() }
+            check(other.runtime.rememberedTools.isEmpty, "permissions never leak into another project")
         }
         do {
             let f = try Fixture("approval"); defer { f.clean() }
@@ -617,7 +795,7 @@ if mode in ('approval-background','approval-duplicate'):assert sys.stdin.read()=
             try f.runtime.updateOptions(model: "haiku", permissionMode: .plan, effort: "low")
             check(f.runtime.currentOptions.translateToEnglish == false && f.runtime.currentOptions.autoTranslateReplies == false,
                   "model changes preserve independent translation preferences")
-            let english = "Please check this project.\n\nPlease respond in English."
+            let english = "Please check this project."
             let chinese = "请检查这个项目。"
             check(f.runtime.send(text: english, originalText: chinese), "translated input can start a real-CCAM fake-model turn")
             spin { !f.runtime.hasRunning }

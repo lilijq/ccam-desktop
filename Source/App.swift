@@ -39,6 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var compactNavigation: ClosureButton!
     private let poolSummary = label("正在读取账号", size: 12, color: Theme.muted)
     private var workspaceSidebar: WorkspaceSidebar!
+    private var sidebarRail: WorkspaceSidebarRail!
+    private var sidebarToggleMenuItem: NSMenuItem?
+    private(set) var sidebarCollapsed = UserDefaults.standard.bool(forKey: WindowSidebarPresentation.preferenceKey)
     private var compactManage: SidebarItemButton!
     private let compactQuota = SidebarQuotaView(compact: true)
     private var mainBottom: NSLayoutConstraint!
@@ -121,6 +124,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         viewMenu.addItem(.separator())
         let desktop = NSMenuItem(title: "桌面布局", action: #selector(desktopLayout), keyEquivalent: "1"); desktop.target = self; viewMenu.addItem(desktop)
         let compact = NSMenuItem(title: "紧凑布局", action: #selector(compactLayout), keyEquivalent: "2"); compact.target = self; viewMenu.addItem(compact)
+        let sidebar = NSMenuItem(title: sidebarCollapsed ? "展开侧边栏" : "收起侧边栏", action: #selector(toggleSidebar), keyEquivalent: "s")
+        sidebar.target = self; sidebar.keyEquivalentModifierMask = [.command, .control]
+        sidebarToggleMenuItem = sidebar; viewMenu.addItem(sidebar)
         viewMenu.addItem(.separator())
         for (index, mode) in AppearanceMode.allCases.enumerated() {
             let item = NSMenuItem(title: mode.title, action: #selector(appearanceMenu(_:)), keyEquivalent: "")
@@ -134,17 +140,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func desktopLayout() { window.setContentSize(NSSize(width: 1240, height: 820)); window.center(); updateWindowLayout() }
     @objc func compactLayout() { window.setContentSize(NSSize(width: 390, height: 800)); window.center(); updateWindowLayout() }
+    @objc func toggleSidebar() {
+        sidebarCollapsed.toggle()
+        UserDefaults.standard.set(sidebarCollapsed, forKey: WindowSidebarPresentation.preferenceKey)
+        updateWindowLayout()
+    }
     func windowDidResize(_ notification: Notification) { updateWindowLayout() }
     private func updateWindowLayout() {
         guard let window, sidebarWidth != nil else { return }
         let width = window.contentView?.bounds.width ?? 1240
-        let shell = width < 780
-        let compact = (width - (shell ? 32 : 272)) < 620
-        sidebarWidth.constant = shell ? 0 : 224
+        let presentation = WindowSidebarPresentation.resolve(width: width, collapsed: sidebarCollapsed)
+        let shell = presentation == .compact
+        let inset: CGFloat = shell ? 16 : 12
+        let compact = (width - presentation.width - inset * 2) < 620
+        sidebarWidth.constant = presentation.width
         sidebarView.isHidden = shell
-        mainLeading.constant = shell ? 16 : 24
-        mainTrailing.constant = shell ? -16 : -24
-        mainBottom.constant = shell ? -82 : 0
+        workspaceSidebar.isHidden = presentation != .expanded
+        sidebarRail.isHidden = presentation != .rail
+        sidebarToggleMenuItem?.title = sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"
+        mainLeading.constant = inset
+        mainTrailing.constant = -inset
+        mainBottom.constant = shell ? -82 : -12
         compactManage.isHidden = !shell
         compactQuota.isHidden = !shell
         compactNavigation.isHidden = !shell
@@ -157,11 +173,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if index == 2 { projectWorkspace.select(project: currentProject) }
         render()
     }
-    private func navigationMenu() {
+    private func navigationMenu(from anchor: NSView? = nil) {
         let menu = NSMenu()
         let create = NSMenuItem(title: "新对话", action: #selector(newConversationMenu), keyEquivalent: "")
         create.target = self
-        create.isEnabled = currentProject.map { projectWorkspace.runningCount(for: $0.id) == 0 } ?? true
+        create.isEnabled = true
         menu.addItem(create)
         for record in projectStore?.activeProjects ?? [] {
             let item = NSMenuItem(title: record.name, action: #selector(pickProject(_:)), keyEquivalent: "")
@@ -177,22 +193,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let item = NSMenuItem(title: conversation.title.isEmpty ? "新对话" : conversation.title, action: #selector(selectSidebarConversation(_:)), keyEquivalent: "")
                 item.target = self; item.representedObject = conversation.id
                 item.state = projectWorkspace.selectedConversationID == conversation.id ? .on : .off
-                item.isEnabled = currentProject.map { projectWorkspace.runningCount(for: $0.id) == 0 } ?? false
+                item.isEnabled = currentProject != nil
                 menu.addItem(item)
             }
         }
-        if let project = currentProject {
+        if currentProject != nil {
             menu.addItem(.separator())
             let manage = NSMenuItem(title: "对话管理…", action: #selector(manageCompactConversation), keyEquivalent: "")
-            manage.target = self; manage.isEnabled = projectWorkspace.runningCount(for: project.id) == 0
+            manage.target = self; manage.isEnabled = projectWorkspace.selectedConversationID != nil
             menu.addItem(manage)
         }
         menu.autoenablesItems = false
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: compactNavigation.bounds.height + 4), in: compactNavigation)
+        let source = anchor ?? compactNavigation!
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: source.bounds.height + 4), in: source)
     }
     @objc private func newConversationMenu() { newSidebarConversation() }
+    var conversationMenuAnchor: NSView {
+        !compactShell && sidebarCollapsed ? sidebarRail.projectsButton : compactNavigation
+    }
     @objc private func manageCompactConversation() {
-        projectWorkspace.showConversationActions(id: projectWorkspace.selectedConversationID ?? "", from: compactNavigation)
+        projectWorkspace.showConversationActions(id: projectWorkspace.selectedConversationID ?? "", from: conversationMenuAnchor)
     }
     @objc private func selectSidebarConversation(_ item: NSMenuItem) {
         guard let id = item.representedObject as? String else { return }
@@ -206,15 +226,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         else if accounts.isEmpty { poolSummary.stringValue = "添加账号后开始任务" }
         else { poolSummary.stringValue = summary.detail }
         workspaceSidebar?.updateQuota(summary, readFailed: accountsError != nil || usageError != nil)
+        sidebarRail?.updateQuota(summary, readFailed: accountsError != nil || usageError != nil)
         compactQuota.update(summary, readFailed: accountsError != nil || usageError != nil)
     }
-    func makeWindow() {
+    func makeWindow(visible: Bool = true) {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1240, height: 820), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = "CCAM Desktop"; window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true
         window.minSize = NSSize(width: 390, height: 640); window.backgroundColor = Theme.background; window.delegate = self
-        let root = ThemeSurface(Theme.background); window.contentView = root
+        window.isMovableByWindowBackground = false
+        let root = ThemeSurface(Theme.workspaceCanvas); window.contentView = root
         let side = ThemeSurface(Theme.sidebar); side.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(side); sidebarView = side
         workspaceSidebar = WorkspaceSidebar(frame: .zero); workspaceSidebar.translatesAutoresizingMaskIntoConstraints = false; side.addSubview(workspaceSidebar)
+        workspaceSidebar.onCollapse = { [weak self] in self?.toggleSidebar() }
+        sidebarRail = WorkspaceSidebarRail(frame: .zero); sidebarRail.translatesAutoresizingMaskIntoConstraints = false; side.addSubview(sidebarRail)
+        sidebarRail.onExpand = { [weak self] in self?.toggleSidebar() }
+        sidebarRail.onNewConversation = { [weak self] in self?.newSidebarConversation() }
+        sidebarRail.onProjects = { [weak self] anchor in self?.navigationMenu(from: anchor) }
+        sidebarRail.onQuota = { [weak self] in self?.navigate(to: 1) }
+        sidebarRail.onManage = { [weak self] anchor in self?.showManagement(from: anchor) }
         workspaceSidebar.onNewConversation = { [weak self] in self?.newSidebarConversation() }
         workspaceSidebar.onAddProject = { [weak self] in self?.chooseProject() }
         workspaceSidebar.onProjects = { [weak self] in self?.navigate(to: 0) }
@@ -247,17 +276,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         compactQuota.handler = { [weak self] in self?.navigate(to: 1) }
         compactQuota.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(compactQuota)
         let main = NSView(); main.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(main)
+        let dragSurface = WindowDragSurface(frame: .zero); dragSurface.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(dragSurface)
         projectButton.actionBlock = { [weak self] in self?.projectPicker() }
         projectButton.isBordered = false; projectButton.font = Theme.font(size: 14, weight: .medium)
         projectButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal); projectButton.lineBreakMode = .byTruncatingMiddle
         compactNavigation = ClosureButton("", symbol: "sidebar.left") { [weak self] in self?.navigationMenu() }
         compactNavigation.isBordered = false; compactNavigation.setAccessibilityLabel("项目导航"); compactNavigation.toolTip = "项目导航"; compactNavigation.widthAnchor.constraint(equalToConstant: 32).isActive = true
         let context = row([compactNavigation, projectButton, spacer()], spacing: 6)
-        let top = adaptiveRow([context, projectWorkspace.sectionControl], spacing: 12, breakpoint: 620)
+        let top = adaptiveRow([context, projectWorkspace.sectionControl], spacing: 8, breakpoint: 470)
         top.translatesAutoresizingMaskIntoConstraints = false; main.addSubview(top)
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false; scroll.translatesAutoresizingMaskIntoConstraints = false; main.addSubview(scroll); contentScroll = scroll
         projectWorkspace.translatesAutoresizingMaskIntoConstraints = false; projectWorkspace.isHidden = true; main.addSubview(projectWorkspace)
         projectWorkspace.onStateChange = { [weak self] in self?.updateSidebar() }
+        projectWorkspace.onConfigureProxy = { [weak self] in self?.configureProxy() }
         projectWorkspace.onTurnFinished = { [weak self] in self?.refresh(liveUsage: true) }
         projectWorkspace.onInteractiveTask = { [weak self] record, target in
             guard let self else { return }
@@ -287,28 +318,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         content = TopAlignedStack(); content.orientation = .vertical; content.alignment = .leading; content.distribution = .fill; content.spacing = 20; content.edgeInsets = NSEdgeInsets(top: 12, left: 0, bottom: 28, right: 0); content.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = content
         sidebarWidth = side.widthAnchor.constraint(equalToConstant: 224)
-        mainLeading = main.leadingAnchor.constraint(equalTo: side.trailingAnchor, constant: 24)
-        mainTrailing = main.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24)
+        mainLeading = main.leadingAnchor.constraint(equalTo: side.trailingAnchor, constant: 12)
+        mainTrailing = main.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12)
         mainBottom = main.bottomAnchor.constraint(equalTo: root.bottomAnchor)
         NSLayoutConstraint.activate([
             side.leadingAnchor.constraint(equalTo: root.leadingAnchor), side.topAnchor.constraint(equalTo: root.topAnchor), side.bottomAnchor.constraint(equalTo: root.bottomAnchor), sidebarWidth,
             workspaceSidebar.leadingAnchor.constraint(equalTo: side.leadingAnchor), workspaceSidebar.widthAnchor.constraint(equalToConstant: 224), workspaceSidebar.topAnchor.constraint(equalTo: side.topAnchor), workspaceSidebar.bottomAnchor.constraint(equalTo: side.bottomAnchor),
+            sidebarRail.leadingAnchor.constraint(equalTo: side.leadingAnchor), sidebarRail.widthAnchor.constraint(equalToConstant: 56), sidebarRail.topAnchor.constraint(equalTo: side.topAnchor), sidebarRail.bottomAnchor.constraint(equalTo: side.bottomAnchor),
+            dragSurface.topAnchor.constraint(equalTo: root.topAnchor), dragSurface.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 90), dragSurface.trailingAnchor.constraint(equalTo: root.trailingAnchor), dragSurface.heightAnchor.constraint(equalToConstant: 36),
             compactManage.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16), compactManage.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -24), compactManage.widthAnchor.constraint(equalToConstant: 36), compactManage.heightAnchor.constraint(equalToConstant: 36),
             compactQuota.leadingAnchor.constraint(equalTo: compactManage.trailingAnchor, constant: 6), compactQuota.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16), compactQuota.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8), compactQuota.heightAnchor.constraint(equalToConstant: 64),
             mainLeading, mainTrailing, main.topAnchor.constraint(equalTo: root.topAnchor, constant: 36), mainBottom,
-            top.topAnchor.constraint(equalTo: main.topAnchor), top.leadingAnchor.constraint(equalTo: main.leadingAnchor), top.trailingAnchor.constraint(equalTo: main.trailingAnchor), top.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
-            scroll.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 14), scroll.leadingAnchor.constraint(equalTo: main.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: main.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: main.bottomAnchor),
+            top.topAnchor.constraint(equalTo: main.topAnchor), top.leadingAnchor.constraint(equalTo: main.leadingAnchor), top.trailingAnchor.constraint(equalTo: main.trailingAnchor), top.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            scroll.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 8), scroll.leadingAnchor.constraint(equalTo: main.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: main.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: main.bottomAnchor),
             projectWorkspace.topAnchor.constraint(equalTo: scroll.topAnchor), projectWorkspace.bottomAnchor.constraint(equalTo: scroll.bottomAnchor), projectWorkspace.leadingAnchor.constraint(equalTo: scroll.leadingAnchor), projectWorkspace.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
             content.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), content.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor), content.topAnchor.constraint(equalTo: scroll.contentView.topAnchor), content.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
         ])
         projectWorkspace.select(project: currentProject)
-        updateWindowLayout(); render(); window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        updateWindowLayout(); render(); window.center()
+        if visible { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     }
     private func updateSidebar() {
         let records = projectStore?.activeProjects ?? []
         workspaceSidebar?.prepareProjects(records, currentID: currentProject?.id)
         let groups = projectWorkspace.sidebarGroups(records: records, expandedIDs: workspaceSidebar?.expandedProjectIDs ?? [])
         workspaceSidebar?.update(groups: groups, currentID: currentProject?.id)
+        sidebarRail?.newButton.isEnabled = true
         updatePoolSummary()
     }
     private func newSidebarConversation() {
@@ -316,7 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         workspaceSidebar.revealProject(project.id)
         showProjectWorkspace(project, newConversation: true)
     }
-    @objc private func managementMenu() { showManagement(from: compactShell ? compactManage : workspaceSidebar.manageButton) }
+    @objc private func managementMenu() { showManagement(from: compactShell ? compactManage : (sidebarCollapsed ? sidebarRail.manageButton : workspaceSidebar.manageButton)) }
     private func showManagement(from sender: NSView) {
         if managementPopover?.isShown == true { managementPopover?.close(); return }
         updatePoolSummary()
@@ -606,7 +641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func configureProxy() {
         let alert = NSAlert(); alert.messageText = "网络代理"
-        alert.informativeText = "聊天、登录和终端统一使用此代理。留空跟随系统；没有有效代理时阻止启动。"
+        alert.informativeText = "聊天、网页、登录和终端统一使用此代理。留空跟随系统；没有有效代理时阻止启动。"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 28))
         field.placeholderString = "http://127.0.0.1:端口"
         field.stringValue = UserDefaults.standard.string(forKey: ExecutionProxy.defaultsKey) ?? ""

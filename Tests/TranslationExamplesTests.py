@@ -37,13 +37,20 @@ class TranslationExamplesTests(unittest.TestCase):
 
 def example_test(case):
     def run(self):
+        for marker in ["CCAM", "ZXQ"]:
+            parts, _ = self.worker.segments(case["input"], case["source"], marker)
+            model_input = " ".join(value for enabled, value in parts if enabled)
+            for literal in case.get("excluded_from_model", []):
+                self.assertNotIn(literal, model_input, "No-translate content must never enter local model input")
         output = self.worker.translate(case["input"], case["source"], case["target"], self.home)
         self.assertIsInstance(output, str)
         self.assertTrue(output.strip())
         for literal in case["literals"]:
             self.assertEqual(output.count(literal), case["input"].count(literal),
                              "Protected literal changed, disappeared or duplicated: " + literal)
-        if case.get("unchanged"):
+        if "expected_output" in case:
+            self.assertEqual(output, case["expected_output"])
+        elif case.get("unchanged"):
             self.assertEqual(output, case["input"])
         else:
             self.assertNotEqual(output, case["input"])
@@ -51,6 +58,8 @@ def example_test(case):
                 self.assertRegex(output, r"[\u3400-\u9fff]")
             else:
                 self.assertRegex(output, r"[A-Za-z]")
+        if case.get("remove_wrappers"):
+            self.assertNotIn("～", output, "No-translate wrappers must not be sent as message content")
         if case.get("negation_regex"):
             # A structural regression guard, NOT a semantic equivalence proof.
             self.assertRegex(output, case["negation_regex"])
@@ -82,6 +91,13 @@ def write_report(path):
         "\n自动检查覆盖：非空输出、目标语言字符、代码/命令/标识符/路径/URL 的精确保留与出现次数、"
         "Markdown 标题列表及表格结构、纯代码和纯标点不变，以及选定句子的否定词保留。"
         "这些检查不等于语义完全准确；下方保留每一次真实输出，未人工润色。",
+        "\n## 全角波浪号免译约定\n",
+        "`～内容～` 与 `～～内容～～` 都会保留内容、移除外层包裹符，支持多段、多行；例如 `～parrot-ai-server-rust～` 输出 `parrot-ai-server-rust`。"
+        "未闭合时仅去掉开头标记，其后至文本末尾的内容保持原样。"
+        "免译内容在分段阶段就被遮蔽，不会进入本地翻译模型输入；原占位符同名文字、代码、链接及表格可组合使用。",
+        "\n代码围栏、行内代码与缩进代码优先保留，其中孤立的 `～` 不会把后续说明吞入免译区域。"
+        "代码中的全角波浪号不删除。ASCII `~`、`~~删除线~~`、`~~~` 围栏沿用原有规则。"
+        "需要翻译正文时，免译区域外侧空格可能被整理；只有英文正文、纯免译或纯代码而无需翻译时，除显式包裹符外的字符及空白逐字保留。",
         "\n## 已知语义限制\n",
         "- 小模型可能误译短词：本次 `Notes` 译为 `页:1`，URL 示例中的 `steps` 译为 `台阶`。",
         "- 中文“项目/文件”在一例译为 `item/documents`，英文 `Do not commit changes` 译为“不执行更改”，Git 提交的精确含义丢失。",

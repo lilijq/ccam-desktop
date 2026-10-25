@@ -1,5 +1,6 @@
 import AppKit
 
+if let code = WebMCP.handleHelperInvocation() { exit(code) }
 if let code = BrowserRouting.handleHelperInvocation() { exit(code) }
 if let code = GlobalPool.handleHelperInvocation() { exit(code) }
 

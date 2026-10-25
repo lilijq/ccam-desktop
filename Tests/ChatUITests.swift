@@ -24,6 +24,7 @@ private final class FixtureWindow: NSWindow {
         try png.write(to: root.appendingPathComponent(name + ".png"))
     }
     static func main() throws {
+        if let code = GlobalPool.handleHelperInvocation() { exit(code) }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ccam-ui-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -264,7 +265,10 @@ private final class FixtureWindow: NSWindow {
         checks += try AccountRefreshUITests.run()
         checks += try TurnQuotaRefreshUITests.run()
         checks += try TranslationUITests.run()
+        checks += try MarkdownUITests.run()
         checks += try WorkspaceSplitUITests.run()
+        checks += try MultiConversationWorkspaceUITests.run()
+        checks += try WindowChromeUITests.run()
         checks += try PaneContentUITests.run()
         checks += try MultiRepositoryGitUITests.run()
         checks += try ProjectFilesUITests.run(root: root)

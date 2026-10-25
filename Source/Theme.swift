@@ -23,6 +23,9 @@ enum Theme {
     }
     static let background = adaptive(0xFAFAFA, 0x111111)
     static let panel = adaptive(0xFFFFFF, 0x1C1C1C)
+    static let workspaceCanvas = adaptive(0xF2F2F2, 0x090909)
+    static let workspacePanel = adaptive(0xFFFFFF, 0x141414)
+    static let workspaceBorder = adaptive(0xDCDCDC, 0x2A2A2A)
     static let sidebar = adaptive(0xF0F0F0, 0x080808)
     static let accent = adaptive(0x292929, 0xECECEC)
     static let primary = adaptive(0x202020, 0xEAEAEA)

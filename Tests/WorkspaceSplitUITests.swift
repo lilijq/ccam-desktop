@@ -22,6 +22,33 @@ enum WorkspaceSplitUITests {
         let invalid = WorkspacePaneLayout(root: .split(id: UUID(), axis: .right, ratio: 0.5, first: .pane(0), second: .pane(0)), active: 0)
         check(!invalid.isValid, "duplicate-section persisted layouts are rejected")
 
+        // Test every ordered edge/center move on a populated tree. Moving is
+        // atomic and preserves the set of unique content owners.
+        let dragModel = WorkspacePaneLayout(root: .split(id: UUID(), axis: .right, ratio: 0.62,
+            first: .split(id: UUID(), axis: .down, ratio: 0.35, first: .pane(0), second: .pane(1)),
+            second: .split(id: UUID(), axis: .down, ratio: 0.7, first: .pane(2), second: .pane(3))), active: 0)
+        for source in 0...3 {
+            for target in 0...3 where source != target {
+                for position in WorkspacePaneDropPosition.allCases {
+                    var moved = dragModel
+                    check(moved.move(source, relativeTo: target, position: position) && moved.isValid && Set(moved.root.sections) == Set(0...3) && moved.active == source,
+                          "every valid pane drop retains all unique panes and produces a valid tree")
+                    if position == .center {
+                        check(moved.root == dragModel.root.swapping(source, target), "center drops preserve exact split identities and ratios while swapping slots")
+                    }
+                }
+            }
+        }
+        var rejected = dragModel
+        check(!rejected.move(0, relativeTo: 0, position: .right) && rejected == dragModel, "self drops leave layout and selection unchanged")
+        check(!rejected.move(4, relativeTo: 0, position: .left) && rejected == dragModel, "hidden source cannot mutate layout")
+        check(!rejected.move(0, relativeTo: 9, position: .center) && rejected == dragModel, "invalid destination cannot mutate layout")
+        let dropBounds = NSRect(x: 0, y: 0, width: 400, height: 300)
+        check(WorkspacePaneDropPosition.at(NSPoint(x: 200, y: 150), in: dropBounds) == .center, "the center is an exchange target")
+        check(WorkspacePaneDropPosition.at(NSPoint(x: 5, y: 150), in: dropBounds) == .left && WorkspacePaneDropPosition.at(NSPoint(x: 395, y: 150), in: dropBounds) == .right, "horizontal edges select their own docking directions")
+        check(WorkspacePaneDropPosition.at(NSPoint(x: 200, y: 295), in: dropBounds) == .top && WorkspacePaneDropPosition.at(NSPoint(x: 200, y: 5), in: dropBounds) == .bottom, "vertical drop coordinates match native AppKit orientation")
+        check(WorkspacePaneDropPosition.at(NSPoint(x: -1, y: 150), in: dropBounds) == nil, "outside drops have no target")
+
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("ccam-split-test-" + UUID().uuidString)
         let root = temporary.appendingPathComponent("sample-project")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -89,10 +116,9 @@ enum WorkspaceSplitUITests {
         check(difference.string.contains("Hello from Rust"), "the Git pane loads a real local diff without remote access")
         workspace.layoutSubtreeIfNeeded()
         check(Set(workspace.visibleSections.map(\.rawValue)) == Set(0...3) && workspace.displayedSections.count == 4, "all four workspace capabilities can coexist")
-        let chatPanePicker = all(workspace).compactMap { $0 as? NSPopUpButton }.first { $0.accessibilityLabel() == "窗格内容：对话" }!
-        chatPanePicker.selectItem(at: SectionIndex.files)
-        _ = NSApp.sendAction(chatPanePicker.action!, to: chatPanePicker.target, from: chatPanePicker)
-        check(workspace.selectedSection == .files && chatPanePicker.indexOfSelectedItem == SectionIndex.chat, "choosing an existing pane focuses it and restores the original pane title")
+        workspace.showSection(.files)
+        let paneTitles = all(workspace).compactMap { $0 as? NSTextField }.filter { $0.accessibilityLabel() == "窗格标题" }.map(\.stringValue)
+        check(workspace.selectedSection == .files && paneTitles.contains("比较文件和改动"), "pane headers use the actual conversation title while focusing another pane")
         check(all(workspace).compactMap { $0 as? ProjectChatView }.count == 1 && all(workspace).compactMap { $0 as? TerminalWorkspace }.count == 1, "splitting never duplicates a chat runtime or terminal host")
         check(input.string == draft && input.window === window, "draft input survives mounting into a nested pane")
         check(!terminal.hasRunning && !workspace.hasRunning && !terminalFixture.session.running, "opening panes and rendering sample output starts no terminal or Claude processes")
@@ -102,7 +128,7 @@ enum WorkspaceSplitUITests {
         divider.setPosition(600, ofDividerAt: 0)
         let afterDrag = WorkspacePaneLayout.load(projectID: project.id)
         if case .split(_, _, let ratio, _, _) = afterDrag.root {
-            check(abs(ratio - 600 / 1433) < 0.02, "divider dragging persists its actual split ratio")
+            check(abs(ratio - 600 / 1432) < 0.02, "divider dragging persists its actual split ratio")
         } else { check(false, "split layout remains present after dragging") }
         workspace.showSection(.chat)
         workspace.togglePaneMaximization(.chat); workspace.layoutSubtreeIfNeeded()
@@ -116,9 +142,9 @@ enum WorkspaceSplitUITests {
         check(workspace.isSinglePanePresentation && workspace.displayedSections == [.chat] && workspace.visibleSections.count == 4, "a narrow window temporarily focuses one pane without losing the split layout")
         check(window.firstResponder === input, "temporarily focusing a narrow pane preserves keyboard input")
         workspace.togglePaneMaximization(.chat)
-        check(all(workspace).compactMap { $0 as? NSButton }.contains { $0.accessibilityLabel() == "恢复分屏" }, "explicit maximization updates compact pane controls")
+        check(workspace.isSinglePanePresentation && workspace.visibleSections.count == 4, "explicit maximization keeps the saved multi-pane layout")
         workspace.togglePaneMaximization(.chat)
-        check(all(workspace).compactMap { $0 as? NSButton }.contains { $0.accessibilityLabel() == "放大窗格：对话" }, "restoring in a narrow window keeps temporary focus distinct from maximization")
+        check(all(workspace).compactMap { $0 as? NSButton }.contains { $0.accessibilityLabel() == "窗格操作：比较文件和改动" }, "narrow panes keep their compact operations menu")
         try ChatUITests.snapshot(host, name: "workspace-compact-focus")
         window.setContentSize(NSSize(width: 1440, height: 850)); workspace.layoutSubtreeIfNeeded()
         check(workspace.displayedSections.count == 4, "widening the window automatically restores the saved split arrangement")
@@ -148,10 +174,61 @@ enum WorkspaceSplitUITests {
         check(WorkspacePaneLayout.load(projectID: project.id) == originalLayout, "project switching retains divider ratios")
         let reopened = ProjectWorkspace(terminal: TerminalWorkspace(frame: .zero)); reopened.select(project: project)
         check(reopened.visibleSections.count == 4 && reopened.selectedSection == .files, "a reopened workspace restores its persisted layout")
+        // Move the exact live objects, with an unfinished editor selection.
+        workspace.showSection(.chat); window.makeFirstResponder(input)
+        input.setSelectedRange(NSRange(location: 3, length: 4))
+        let liveChat = chat, liveFiles = files, liveTerminal = terminal
+        let beforeRearrange = WorkspacePaneLayout.load(projectID: project.id)
+        let dragPanes = all(workspace).compactMap { $0 as? WorkspacePaneView }
+        let sourcePane = dragPanes.first { $0.section == 0 }!, targetPane = dragPanes.first { $0.section == 1 }!
+        host.layoutSubtreeIfNeeded(); sourcePane.layoutSubtreeIfNeeded()
+        let dragHandle = all(sourcePane.header).compactMap { $0 as? WorkspacePaneDragHandle }.first
+        check(dragHandle != nil && (dragHandle?.bounds.width ?? 0) >= 24 && (dragHandle?.bounds.height ?? 0) >= 28,
+              "the pane drag handle is visible and has a comfortably sized hit area: \(String(describing: dragHandle?.bounds))")
+        check(sourcePane.header.bounds.height >= 40, "larger drag controls fit inside the pane title bar")
+        check(sourcePane.header.acceptsFirstMouse(for: nil), "pane title accepts the first drag in an inactive window")
+        check(targetPane.acceptsDrag(source: sourcePane.header), "a local pane accepts a matching same-project source")
+        check(!sourcePane.acceptsDrag(source: sourcePane.header), "dragging into the source pane is rejected")
+        let foreignHeader = WorkspacePaneHeader(section: 0, title: "Other project")
+        foreignHeader.context = UUID()
+        check(!targetPane.acceptsDrag(source: foreignHeader), "another project or detached source cannot rearrange the layout")
+        check(!workspace.rearrangePane(.chat, relativeTo: .chat, position: .top) && WorkspacePaneLayout.load(projectID: project.id) == beforeRearrange,
+              "rejected live moves preserve saved layout and selection")
+        check(workspace.rearrangePane(.files, relativeTo: .chat, position: .center), "live center drop swaps pane content owners")
+        check(all(workspace).contains { $0 === liveChat } && all(workspace).contains { $0 === liveFiles } && all(workspace).contains { $0 === liveTerminal }, "rearranging retains chat, editor and terminal view identities")
+        check(input.string == draft && input.selectedRange() == NSRange(location: 3, length: 4) && window.firstResponder === input, "pane movement preserves draft, insertion range and keyboard focus")
+        check(!targetPane.acceptsDrag(source: sourcePane.header), "a source from an obsolete render cannot be reused")
+        check(workspace.rearrangePane(.files, relativeTo: .chat, position: .center), "a second center drop can restore the original arrangement")
+        try ChatUITests.snapshot(host, name: "workspace-draggable-panes")
         workspace.closePane(.git); workspace.layoutSubtreeIfNeeded()
         check(workspace.visibleSections == [.chat, .files, .terminal] && input.string == draft, "closing one pane leaves its neighbors and draft intact")
         workspace.showSection(.chat); workspace.resetLayout(); workspace.layoutSubtreeIfNeeded()
         check(workspace.visibleSections == [.chat] && input.string == draft, "closing other panes preserves the selected chat")
+        // Only top-level tool navigation uses the companion layout policy.
+        workspace.showSection(.files)
+        workspace.openSectionFromNavigation(.files); workspace.layoutSubtreeIfNeeded()
+        check(workspace.visibleSections == [.chat, .files], "clicking a single existing tool also restores chat on its left")
+        workspace.showSection(.chat); workspace.resetLayout()
+        workspace.openSectionFromNavigation(.files); workspace.layoutSubtreeIfNeeded()
+        check(workspace.visibleSections == [.chat, .files] && workspace.selectedSection == .files, "top Files navigation opens to the right while retaining chat")
+        workspace.togglePaneMaximization(.chat)
+        workspace.openSectionFromNavigation(.files); workspace.layoutSubtreeIfNeeded()
+        check(workspace.displayedSections == [.chat, .files] && !workspace.isSinglePanePresentation, "top tool navigation restores the companion layout from a maximized conversation")
+        workspace.openSectionFromNavigation(.git); workspace.layoutSubtreeIfNeeded()
+        check(workspace.visibleSections == [.chat, .git] && workspace.selectedSection == .git, "top Git navigation reuses the companion pane")
+        workspace.openSectionFromNavigation(.terminal); workspace.layoutSubtreeIfNeeded()
+        check(workspace.visibleSections == [.chat, .terminal] && workspace.selectedSection == .terminal, "top Terminal navigation reuses the companion pane without starting a process")
+        workspace.openSectionFromNavigation(.chat)
+        check(workspace.visibleSections == [.chat, .terminal] && workspace.selectedSection == .chat, "top Chat navigation focuses the preserved conversation")
+        workspace.openSectionFromNavigation(.files)
+        check(workspace.visibleSections == [.chat, .files] && input.string == draft, "a focused chat is never replaced by tool navigation")
+        workspace.showSection(.chat); _ = workspace.splitActive(adding: .git, axis: .down)
+        let customSections = Set(workspace.visibleSections)
+        workspace.openSectionFromNavigation(.files)
+        check(Set(workspace.visibleSections) == customSections && workspace.selectedSection == .files, "selecting an existing tool preserves a custom layout")
+        workspace.openSectionFromNavigation(.terminal)
+        check(Set(workspace.visibleSections) == Set([.chat, .git, .terminal]), "a new tool replaces only the focused tool inside a custom layout")
+        check(input.string == draft && !terminal.hasRunning && !workspace.hasRunning, "navigation and drag tests preserve drafts and start no execution")
         check(!window.isVisible, "split workspace validation stays offscreen")
         return checks
     }

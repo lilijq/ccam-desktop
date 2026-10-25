@@ -249,5 +249,338 @@
       "`user_id`"
     ],
     "title": "英文原文占位符同名标识符"
+  },
+  {
+    "id": "fullwidth_single_zh",
+    "title": "中文单符免译",
+    "source": "zh",
+    "target": "en",
+    "input": "请保留 ～这个产品叫鹦鹉～，并解释安装步骤。",
+    "literals": [
+      "这个产品叫鹦鹉"
+    ],
+    "excluded_from_model": [
+      "这个产品叫鹦鹉"
+    ],
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_double_zh",
+    "title": "中文双符免译",
+    "source": "zh",
+    "target": "en",
+    "input": "请解释这个项目，保留 ～～不要翻译这段内容～～。",
+    "literals": [
+      "不要翻译这段内容"
+    ],
+    "excluded_from_model": [
+      "不要翻译这段内容"
+    ],
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_multiline_zh",
+    "title": "多行免译",
+    "source": "zh",
+    "target": "en",
+    "input": "请解释 ～第一行保持中文\n第二行保留 user_id 和 `cargo test`～ 的用途。",
+    "literals": [
+      "第一行保持中文\n第二行保留 user_id 和 `cargo test`"
+    ],
+    "excluded_from_model": [
+      "第一行保持中文",
+      "第二行保留"
+    ],
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_multiple_zh",
+    "title": "多段免译与代码和链接",
+    "source": "zh",
+    "target": "en",
+    "input": "保留 ～产品名称～ 和 ～～精确中文说明～～，检查 `src/main.rs` 并参考 https://example.test/docs。",
+    "literals": [
+      "产品名称",
+      "精确中文说明",
+      "`src/main.rs`",
+      "https://example.test/docs"
+    ],
+    "excluded_from_model": [
+      "产品名称",
+      "精确中文说明"
+    ],
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_unclosed_zh",
+    "title": "未闭合单符保护至末尾",
+    "source": "zh",
+    "target": "en",
+    "input": "请解释这个项目。～后续不翻译\n包括 `main.rs` 和最后一行。",
+    "literals": [
+      "后续不翻译\n包括 `main.rs` 和最后一行。"
+    ],
+    "excluded_from_model": [
+      "后续不翻译",
+      "最后一行"
+    ],
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_unclosed_double_en",
+    "title": "未闭合双符保护至末尾",
+    "source": "en",
+    "target": "zh",
+    "input": "Explain the project. ～～Keep this exact English.\nDo not translate the remaining text.",
+    "literals": [
+      "Keep this exact English.\nDo not translate the remaining text."
+    ],
+    "excluded_from_model": [
+      "Keep this exact English",
+      "Do not translate the remaining text"
+    ],
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_code_boundary_zh",
+    "title": "代码中的孤立全角符不影响后文",
+    "source": "zh",
+    "target": "en",
+    "input": "```rust\nlet label = \"～不闭合\";\nlet id = \"CCAM0 ZXQ1\";\n```\n请解释这个函数，不要修改文件。",
+    "literals": [
+      "```rust\nlet label = \"～不闭合\";\nlet id = \"CCAM0 ZXQ1\";\n```\n"
+    ],
+    "excluded_from_model": [
+      "不闭合"
+    ]
+  },
+  {
+    "id": "fullwidth_table_zh",
+    "title": "表格内免译与竖线",
+    "source": "zh",
+    "target": "en",
+    "input": "| 内容 | 状态 |\n| --- | --- |\n| ～甲|乙～ | 需要检查 |\n",
+    "literals": [
+      "甲|乙"
+    ],
+    "excluded_from_model": [
+      "甲|乙"
+    ],
+    "table": true,
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_markers_en",
+    "title": "免译内原占位符和标识符",
+    "source": "en",
+    "target": "zh",
+    "input": "Keep ～CCAM0 ZXQ1 `user_id`～ unchanged and explain the steps.",
+    "literals": [
+      "CCAM0 ZXQ1 `user_id`"
+    ],
+    "excluded_from_model": [
+      "CCAM0 ZXQ1"
+    ],
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_adjacent_en",
+    "title": "紧邻正文与连续免译段",
+    "source": "en",
+    "target": "zh",
+    "input": "Keep～甲～～乙～and～～丙～～unchanged.",
+    "literals": [
+      "甲",
+      "乙",
+      "丙"
+    ],
+    "excluded_from_model": [
+      "甲",
+      "乙",
+      "丙"
+    ],
+    "remove_wrappers": true
+  },
+  {
+    "id": "fullwidth_only_zh",
+    "title": "整段免译仅去除外层标记",
+    "source": "zh",
+    "target": "en",
+    "input": "～～中文无需翻译\nEnglish stays exact.\n`cargo test`～～",
+    "literals": [
+      "中文无需翻译\nEnglish stays exact.\n`cargo test`"
+    ],
+    "excluded_from_model": [
+      "中文无需翻译",
+      "English stays exact"
+    ],
+    "remove_wrappers": true,
+    "expected_output": "中文无需翻译\nEnglish stays exact.\n`cargo test`"
+  },
+  {
+    "id": "fullwidth_project_name_zh",
+    "title": "中文说明保留英文项目名",
+    "source": "zh",
+    "target": "en",
+    "input": "请分析 ～parrot-ai-server-rust～ 项目，不要修改文件。",
+    "literals": [
+      "parrot-ai-server-rust"
+    ],
+    "excluded_from_model": [
+      "parrot-ai-server-rust"
+    ],
+    "remove_wrappers": true,
+    "negation_regex": "(?i)\\b(?:not|without|no)\\b"
+  },
+  {
+    "id": "fullwidth_project_name_en",
+    "title": "英文说明保留英文项目名",
+    "source": "en",
+    "target": "zh",
+    "input": "Explain ～parrot-ai-server-rust～ without changing its files.",
+    "literals": [
+      "parrot-ai-server-rust"
+    ],
+    "excluded_from_model": [
+      "parrot-ai-server-rust"
+    ],
+    "remove_wrappers": true,
+    "negation_regex": "不|勿|无|未|别"
+  },
+  {
+    "id": "fullwidth_project_name_only_zh",
+    "title": "仅英文项目名免译",
+    "source": "zh",
+    "target": "en",
+    "input": "～parrot-ai-server-rust～",
+    "literals": [
+      "parrot-ai-server-rust"
+    ],
+    "excluded_from_model": [
+      "parrot-ai-server-rust"
+    ],
+    "remove_wrappers": true,
+    "expected_output": "parrot-ai-server-rust"
+  },
+  {
+    "id": "fullwidth_english_only_zh",
+    "title": "英文正文只剥离双层标记",
+    "source": "zh",
+    "target": "en",
+    "input": "  Inspect ～～parrot-ai-server-rust～～ only.\n",
+    "literals": [
+      "parrot-ai-server-rust"
+    ],
+    "excluded_from_model": [
+      "parrot-ai-server-rust"
+    ],
+    "remove_wrappers": true,
+    "expected_output": "  Inspect parrot-ai-server-rust only.\n"
+  },
+  {
+    "id": "fullwidth_code_and_name_zh",
+    "title": "代码中的符号保留、项目名的符号移除",
+    "source": "zh",
+    "target": "en",
+    "input": "Read `～literal～` in ～parrot-ai-server-rust～.",
+    "literals": [
+      "`～literal～`",
+      "parrot-ai-server-rust"
+    ],
+    "excluded_from_model": [
+      "literal",
+      "parrot-ai-server-rust"
+    ],
+    "expected_output": "Read `～literal～` in parrot-ai-server-rust."
+  },
+  {
+    "id": "fullwidth_project_name_only_en",
+    "title": "反向纯免译英文项目名",
+    "source": "en",
+    "target": "zh",
+    "input": "～～parrot-ai-server-rust～～",
+    "literals": [
+      "parrot-ai-server-rust"
+    ],
+    "excluded_from_model": [
+      "parrot-ai-server-rust"
+    ],
+    "remove_wrappers": true,
+    "expected_output": "parrot-ai-server-rust"
+  },
+  {
+    "id": "long_review_en",
+    "source": "en",
+    "target": "zh",
+    "input": "# Review summary\n\n| Component | Status |\n| --- | --- |\n| `module_0.rs` | Check the changes in `commit_0` before deployment. |\n| `module_1.rs` | Check the changes in `commit_1` before deployment. |\n| `module_2.rs` | Check the changes in `commit_2` before deployment. |\n| `module_3.rs` | Check the changes in `commit_3` before deployment. |\n| `module_4.rs` | Check the changes in `commit_4` before deployment. |\n| `module_5.rs` | Check the changes in `commit_5` before deployment. |\n| `module_6.rs` | Check the changes in `commit_6` before deployment. |\n| `module_7.rs` | Check the changes in `commit_7` before deployment. |\n| `module_8.rs` | Check the changes in `commit_8` before deployment. |\n| `module_9.rs` | Check the changes in `commit_9` before deployment. |\n| `module_10.rs` | Check the changes in `commit_10` before deployment. |\n| `module_11.rs` | Check the changes in `commit_11` before deployment. |\n| `module_12.rs` | Check the changes in `commit_12` before deployment. |\n| `module_13.rs` | Check the changes in `commit_13` before deployment. |\n| `module_14.rs` | Check the changes in `commit_14` before deployment. |\n| `module_15.rs` | Check the changes in `commit_15` before deployment. |\n\n## Next steps\n\n- Inspect `src/module_0.rs`, run `cargo test module_0`, and keep configuration unchanged.\n- Inspect `src/module_1.rs`, run `cargo test module_1`, and keep configuration unchanged.\n- Inspect `src/module_2.rs`, run `cargo test module_2`, and keep configuration unchanged.\n- Inspect `src/module_3.rs`, run `cargo test module_3`, and keep configuration unchanged.\n- Inspect `src/module_4.rs`, run `cargo test module_4`, and keep configuration unchanged.\n- Inspect `src/module_5.rs`, run `cargo test module_5`, and keep configuration unchanged.\n- Inspect `src/module_6.rs`, run `cargo test module_6`, and keep configuration unchanged.\n- Inspect `src/module_7.rs`, run `cargo test module_7`, and keep configuration unchanged.\n- Inspect `src/module_8.rs`, run `cargo test module_8`, and keep configuration unchanged.\n- Inspect `src/module_9.rs`, run `cargo test module_9`, and keep configuration unchanged.\n- Inspect `src/module_10.rs`, run `cargo test module_10`, and keep configuration unchanged.\n- Inspect `src/module_11.rs`, run `cargo test module_11`, and keep configuration unchanged.\n- Inspect `src/module_12.rs`, run `cargo test module_12`, and keep configuration unchanged.\n- Inspect `src/module_13.rs`, run `cargo test module_13`, and keep configuration unchanged.\n- Inspect `src/module_14.rs`, run `cargo test module_14`, and keep configuration unchanged.\n- Inspect `src/module_15.rs`, run `cargo test module_15`, and keep configuration unchanged.\n\n```rust\nfn main() { println!(\"hello\"); }\n```\n",
+    "literals": [
+      "`module_0.rs`",
+      "`commit_0`",
+      "`module_1.rs`",
+      "`commit_1`",
+      "`module_2.rs`",
+      "`commit_2`",
+      "`module_3.rs`",
+      "`commit_3`",
+      "`module_4.rs`",
+      "`commit_4`",
+      "`module_5.rs`",
+      "`commit_5`",
+      "`module_6.rs`",
+      "`commit_6`",
+      "`module_7.rs`",
+      "`commit_7`",
+      "`module_8.rs`",
+      "`commit_8`",
+      "`module_9.rs`",
+      "`commit_9`",
+      "`module_10.rs`",
+      "`commit_10`",
+      "`module_11.rs`",
+      "`commit_11`",
+      "`module_12.rs`",
+      "`commit_12`",
+      "`module_13.rs`",
+      "`commit_13`",
+      "`module_14.rs`",
+      "`commit_14`",
+      "`module_15.rs`",
+      "`commit_15`",
+      "`src/module_0.rs`",
+      "`cargo test module_0`",
+      "`src/module_1.rs`",
+      "`cargo test module_1`",
+      "`src/module_2.rs`",
+      "`cargo test module_2`",
+      "`src/module_3.rs`",
+      "`cargo test module_3`",
+      "`src/module_4.rs`",
+      "`cargo test module_4`",
+      "`src/module_5.rs`",
+      "`cargo test module_5`",
+      "`src/module_6.rs`",
+      "`cargo test module_6`",
+      "`src/module_7.rs`",
+      "`cargo test module_7`",
+      "`src/module_8.rs`",
+      "`cargo test module_8`",
+      "`src/module_9.rs`",
+      "`cargo test module_9`",
+      "`src/module_10.rs`",
+      "`cargo test module_10`",
+      "`src/module_11.rs`",
+      "`cargo test module_11`",
+      "`src/module_12.rs`",
+      "`cargo test module_12`",
+      "`src/module_13.rs`",
+      "`cargo test module_13`",
+      "`src/module_14.rs`",
+      "`cargo test module_14`",
+      "`src/module_15.rs`",
+      "`cargo test module_15`"
+    ],
+    "title": "长技术回复：表格与大量代码标识符",
+    "markdown_prefixes": true,
+    "table": true
   }
 ]

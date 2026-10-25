@@ -9,7 +9,7 @@ struct ChatApprovalQuestion {
     let multiSelect: Bool
 }
 
-/// A request from one running process, never a reusable permission rule.
+/// A request tied to one live process. Project permissions are stored separately.
 struct ChatApproval {
     enum Kind { case tool, question, plan }
     let id: String
@@ -51,7 +51,9 @@ struct ChatStreamDecoder {
 /// Every send is a separate exact-session print turn, not a replay of history.
 final class ChatRuntime {
     let project: ProjectRecord
+    let boundConversationID: String?
     private let store: ChatStore
+    private var storeObservation: NSObjectProtocol?
     private let executable: String
     private let helper: String
     private let environment: [String: String]
@@ -64,6 +66,7 @@ final class ChatRuntime {
     private(set) var needsTerminalInteraction = false
     private(set) var pendingApprovals: [ChatApproval] = []
     var beforeStart: (([String]) throws -> Void)?
+    var webMCPArguments: (() throws -> [String])?
     var onChange: (() -> Void)?
     var onMessage: ((ChatMessage) -> Void)?
     var onState: ((String) -> Void)?
@@ -112,6 +115,7 @@ final class ChatRuntime {
     var activeConversations: [ChatConversation] { conversations.filter { $0.deletedAt == nil } }
     var deletedConversations: [ChatConversation] { conversations.filter { $0.deletedAt != nil }.sorted { $0.deletedAt! > $1.deletedAt! } }
     var currentConversation: ChatConversation? { activeConversations.first { $0.id == selectedID } }
+    var boundConversationUnavailable: Bool { boundConversationID != nil && currentConversation == nil }
     var currentOptions: ChatOptions { currentConversation?.options ?? ChatOptions() }
     var currentAttachments: [ChatAttachment] { currentConversation?.draftAttachments ?? [] }
     var terminalFallback: ChatTerminalTarget {
@@ -122,32 +126,47 @@ final class ChatRuntime {
                            conversationID: currentConversation?.id)
     }
 
-    init(project: ProjectRecord, store: ChatStore? = nil, ccamExecutable: String = CCAMClient.executable,
+    init(project: ProjectRecord, conversationID: String? = nil, store: ChatStore? = nil, ccamExecutable: String = CCAMClient.executable,
          helperExecutable: String = CommandLine.arguments[0], environment: [String: String] = CCAMClient.environment,
          retryInterval: TimeInterval = GlobalPool.retryInterval, maximumWait: TimeInterval = GlobalPool.maximumWait) throws {
-        self.project = project; self.store = try store ?? ChatStore(project: project)
+        self.project = project; self.boundConversationID = conversationID; self.store = try store ?? ChatStore(project: project)
         self.executable = ccamExecutable; self.helper = helperExecutable; self.environment = environment
         self.retryInterval = retryInterval; self.maximumWait = maximumWait
-        conversations = self.store.conversations; selectedID = self.store.selectedID
+        conversations = self.store.conversations
+        if let conversationID, !conversations.contains(where: { $0.id == conversationID && $0.deletedAt == nil }) {
+            throw AppError.message("这段对话已删除或不存在，无法打开。")
+        }
+        selectedID = conversationID ?? self.store.selectedID
         if currentConversationTransferred { stateText = "终端中，可先写草稿" }
+        storeObservation = NotificationCenter.default.addObserver(forName: ChatStore.didChange, object: nil, queue: .main) { [weak self] notification in
+            guard let self, let other = notification.object as? ChatStore, other !== self.store,
+                  other.fileURL.standardizedFileURL == self.store.fileURL.standardizedFileURL else { return }
+            self.reloadConversationIndex()
+        }
     }
 
     deinit {
+        if let storeObservation { NotificationCenter.default.removeObserver(storeObservation) }
         poll?.invalidate(); retry?.invalidate(); saveTimer?.invalidate(); initializationTimer?.invalidate()
         try? inputHandle?.close()
         if let process, process.isRunning { process.terminate() }
         if let plan { GlobalPool.clean(plan) }
     }
 
-    func createConversation() {
-        guard !hasRunning else { return }
-        let conversation = ChatConversation(id: UUID().uuidString, title: "新对话", projectID: project.id.uuidString, directory: project.path)
-        conversations.insert(conversation, at: 0); selectedID = conversation.id
-        needsTerminalInteraction = false; stateText = "可以开始新任务"
-        persist(); changed()
+    @discardableResult
+    func createConversation() -> String? {
+        guard !hasRunning, boundConversationID == nil else { return nil }
+        do {
+            let id = try store.createConversation()
+            conversations = store.conversations; selectedID = id
+            needsTerminalInteraction = false; stateText = "可以开始新任务"; changed()
+            return id
+        } catch { state("无法创建对话：" + error.localizedDescription); return nil }
     }
 
     func select(id: String) {
+        guard boundConversationID == nil || boundConversationID == id else { return }
+        do { try synchronize() } catch { state(error.localizedDescription); return }
         guard !hasRunning, activeConversations.contains(where: { $0.id == id }) else { return }
         selectedID = id; needsTerminalInteraction = false
         stateText = currentConversationTransferred ? "终端中，可先写草稿" : "继续这段对话"
@@ -155,6 +174,7 @@ final class ChatRuntime {
     }
 
     func updateOptions(model: String?, permissionMode: ChatPermissionMode, effort: String? = nil) throws {
+        try synchronize(); try requireBoundConversation()
         guard !hasRunning else { throw AppError.message("请等待本轮完成或先停止，再修改模型与模式。") }
         let validatedModel = try GlobalPool.validatedChatModel(model)
         let effort = try GlobalPool.validatedChatEffort(effort)
@@ -176,6 +196,7 @@ final class ChatRuntime {
     }
 
     func renameConversation(id: String, title: String) throws {
+        try synchronize()
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.count <= 120, !trimmed.contains(where: { $0.isNewline }) else { throw AppError.message("名称需为 1–120 个字符，不能换行。") }
         guard let index = conversations.firstIndex(where: { $0.id == id && $0.deletedAt == nil }) else { throw AppError.message("这段对话已不存在。") }
@@ -184,6 +205,7 @@ final class ChatRuntime {
     }
 
     func setDraftAttachments(_ attachments: [ChatAttachment]) throws {
+        try synchronize(); try requireBoundConversation()
         guard !hasRunning, !currentConversationTransferred else { throw AppError.message("请等待本轮完成，再修改附件。") }
         try ChatAttachmentStore(project: project).validate(attachments)
         var updated = conversations
@@ -214,6 +236,7 @@ final class ChatRuntime {
     /// Deletion only moves the desktop record to its recoverable deleted list.
     /// Native Claude transcripts and project files are never removed.
     func deleteConversation(id: String) throws {
+        try synchronize()
         guard !(hasRunning && runConversationID == id) else { throw AppError.message("请先停止这段对话，再删除。") }
         guard let index = conversations.firstIndex(where: { $0.id == id && $0.deletedAt == nil }) else { throw AppError.message("这段对话已不存在。") }
         var updated = conversations; updated[index].deletedAt = Date(); updated[index].updatedAt = Date()
@@ -222,6 +245,7 @@ final class ChatRuntime {
     }
 
     func restoreConversation(id: String) throws {
+        try synchronize()
         guard let index = conversations.firstIndex(where: { $0.id == id && $0.deletedAt != nil }) else { throw AppError.message("未找到这段已删除的对话。") }
         var updated = conversations; updated[index].deletedAt = nil; updated[index].updatedAt = Date()
         try saveMetadata(updated, selectedID: hasRunning ? selectedID : id)
@@ -229,11 +253,45 @@ final class ChatRuntime {
 
     private func saveMetadata(_ updated: [ChatConversation], selectedID: String?) throws {
         // Commit first: a failed disk write must not hide a conversation in memory.
-        try store.save(updated, selectedID: selectedID)
-        if self.selectedID != store.selectedID && !hasRunning { needsTerminalInteraction = false }
-        conversations = updated; self.selectedID = store.selectedID
-        if !hasRunning { stateText = currentConversationTransferred ? "终端中，可先写草稿" : currentConversation == nil ? "可以开始新任务" : "继续这段对话" }
+        let previousSelection = self.selectedID
+        try saveMerged(updated, selectedID: selectedID)
+        if self.selectedID != previousSelection && !hasRunning { needsTerminalInteraction = false }
+        if !hasRunning { stateText = boundConversationUnavailable ? "这段对话已删除" : currentConversationTransferred ? "终端中，可先写草稿" : currentConversation == nil ? "可以开始新任务" : "继续这段对话" }
         changed()
+    }
+
+    private func saveMerged(_ updated: [ChatConversation], selectedID: String?) throws {
+        try store.save(updated, selectedID: selectedID, preserveSelection: boundConversationID != nil)
+        conversations = store.conversations
+        self.selectedID = boundConversationID ?? store.selectedID
+    }
+
+    private func rollbackMerged(attempted: [ChatConversation], to previous: [ChatConversation], selectedID: String?) throws {
+        try store.rollback(attempted: attempted, to: previous, selectedID: selectedID, preserveSelection: boundConversationID != nil)
+        conversations = store.conversations
+        self.selectedID = boundConversationID ?? store.selectedID
+    }
+
+    private func synchronize() throws {
+        conversations = try store.rebase(conversations)
+        if let boundConversationID { selectedID = boundConversationID }
+        else if !hasRunning, !activeConversations.contains(where: { $0.id == selectedID }) { selectedID = activeConversations.first?.id }
+    }
+
+    private func requireBoundConversation() throws {
+        if boundConversationUnavailable { throw AppError.message("这段对话已删除或不存在，请新建对话。") }
+    }
+
+    func reloadConversationIndex() {
+        do {
+            let wasUnavailable = boundConversationUnavailable
+            try synchronize()
+            if boundConversationUnavailable {
+                if hasRunning { stop() }
+                stateText = "这段对话已删除"
+            } else if wasUnavailable, !hasRunning { stateText = currentConversationTransferred ? "终端中，可先写草稿" : "继续这段对话" }
+            changed()
+        } catch { state("聊天记录读取失败：" + error.localizedDescription) }
     }
 
     func markTransferredToTerminal() {
@@ -246,6 +304,7 @@ final class ChatRuntime {
     /// ownership first prevents a live terminal and an editable chat from ever
     /// owning the same native session after a failed metadata write.
     func transferToTerminal(start: (ChatTerminalTarget) throws -> Void) throws {
+        try synchronize(); try requireBoundConversation()
         guard !hasRunning, let conversation = currentConversation, !conversation.transferredToTerminal,
               conversation.continuityUnavailable != true, conversation.terminalIdentityUncertain != true,
               let index = conversations.firstIndex(where: { $0.id == conversation.id }) else {
@@ -263,7 +322,7 @@ final class ChatRuntime {
             let startError = error
             conversations = previous; selectedID = selection; needsTerminalInteraction = previousInteraction
             do {
-                try store.save(previous, selectedID: selection)
+                try rollbackMerged(attempted: updated, to: previous, selectedID: selection)
                 state(previousState)
             } catch {
                 state("终端未启动，原聊天已恢复；本地记录恢复失败，请检查保存位置。")
@@ -327,6 +386,7 @@ final class ChatRuntime {
     }
 
     private func updateTranslationOptions(_ change: (inout ChatOptions) -> Void) throws {
+        try synchronize(); try requireBoundConversation()
         guard !hasRunning else { throw AppError.message("请等待本轮完成或先停止，再修改翻译设置。") }
         var updated = conversations
         let id = currentConversation?.id ?? UUID().uuidString
@@ -336,11 +396,11 @@ final class ChatRuntime {
         let index = updated.firstIndex { $0.id == id }!
         var options = updated[index].options ?? ChatOptions(); change(&options)
         updated[index].options = options
-        try store.save(updated, selectedID: id)
-        conversations = updated; selectedID = id; changed()
+        try saveMerged(updated, selectedID: id); changed()
     }
 
     func saveTranslation(messageID: String, sourceText: String, text: String) throws {
+        try synchronize()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 1_048_576 else {
             throw AppError.message("译文为空或过长，原文已保留。")
         }
@@ -350,12 +410,15 @@ final class ChatRuntime {
             throw AppError.message("原文已改变，请重新翻译。")
         }
         updated[conversationIndex].messages[messageIndex].translatedText = text
-        try store.save(updated, selectedID: selectedID)
-        conversations = updated; changed()
+        try saveMerged(updated, selectedID: selectedID); changed()
     }
 
     @discardableResult
     func send(text: String, permissionMode: ChatPermissionMode? = nil, originalText: String? = nil) -> Bool {
+        do { try synchronize() }
+        catch { state("聊天记录读取或保存失败：" + error.localizedDescription); return false }
+        do { try requireBoundConversation() }
+        catch { state(error.localizedDescription); return false }
         let attachments = currentAttachments
         guard !hasRunning, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else { return false }
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "请查看附件。" : text
@@ -386,8 +449,12 @@ final class ChatRuntime {
         attemptedQuotaTickets.removeAll(); waitingSince = nil; generation += 1; hasRunning = true
         changed()
         var metadataCommitted = false
+        var attemptedConversations = updated
         let started = launch(prompt: text, ticket: conversation.ticket, automatic: false, generation: generation) {
-            do { try self.store.save(updated, selectedID: conversation.id); metadataCommitted = true }
+            do {
+                attemptedConversations = self.conversations
+                try self.saveMerged(attemptedConversations, selectedID: conversation.id); metadataCommitted = true
+            }
             catch { throw AppError.message("聊天记录保存失败，任务未启动；输入与附件已保留：" + error.localizedDescription) }
         }
         if started { return true }
@@ -397,7 +464,8 @@ final class ChatRuntime {
         conversations = previousConversations; selectedID = previousSelection
         runConversationID = nil; initialInput = nil; runAttachments = []; hasRunning = false
         do {
-            if metadataCommitted { try store.save(previousConversations, selectedID: previousSelection) }
+            if metadataCommitted { try rollbackMerged(attempted: attemptedConversations, to: previousConversations, selectedID: previousSelection) }
+            else { try synchronize() }
             state(failure)
         }
         catch { state(failure + "；草稿记录恢复失败，输入与附件仍保留，请检查保存位置。") }
@@ -422,10 +490,20 @@ final class ChatRuntime {
         state("已停止，已保存这段对话"); persist(); notifyTurnFinished()
     }
 
-    func approve(id: String) throws {
+    var rememberedTools: Set<String> { store.refreshedRememberedTools() }
+    func clearRememberedPermissions() throws { try store.clearRememberedTools(); changed() }
+    func mayRemember(_ approval: ChatApproval) -> Bool {
+        approval.kind == .tool && runOptions.permissionMode != .plan && effectivePermissionMode != "plan"
+    }
+
+    func approve(id: String, remember: Bool = false) throws {
         let approval = try activeApproval(id)
         guard approval.kind != .question else { throw AppError.message("请先回答问题，再继续。") }
         guard approval.canApprove else { throw AppError.message("请求内容不完整，请拒绝并让 Claude 补充后重试。") }
+        if remember {
+            guard mayRemember(approval) else { throw AppError.message("计划和问题需要逐次确认。") }
+            try store.remember(tool: approval.toolName)
+        }
         try respond(to: approval, result: ["behavior": "allow", "updatedInput": approval.input])
     }
 
@@ -458,7 +536,8 @@ final class ChatRuntime {
     }
 
     private func respond(to approval: ChatApproval, result: [String: Any]) throws {
-        // No updatedPermissions: a click authorizes only this pending call.
+        // Each wire response still authorizes one verified live request.
+        // Reuse is scoped to this project by the separate local permission store.
         let frame: [String: Any] = ["type": "control_response", "response": ["subtype": "success", "request_id": approval.requestID, "response": result]]
         try writeFrame(frame, generation: approval.generation)
         answeredApprovalIDs.insert(approval.requestID)
@@ -507,6 +586,10 @@ final class ChatRuntime {
                                             inputDescription: kind == .plan && complete ? planText : String(decoding: encoded, as: UTF8.self),
                                             reason: reason, kind: kind, questions: questions, canApprove: complete,
                                             requestID: requestID, generation: generation, conversationID: conversationID, input: input))
+        if let approval = pendingApprovals.last, complete, mayRemember(approval), store.refreshedRememberedTools().contains(toolName) {
+            do { try approve(id: approval.id); return }
+            catch { /* Identity/channel validation failed: leave the explicit prompt visible. */ }
+        }
         state(kind == .question ? "等待你的回答" : "等待你的确认")
     }
 
@@ -560,6 +643,7 @@ final class ChatRuntime {
                                                        newSessionID: conversation.sessionID == nil ? UUID().uuidString : nil, ticket: ticket,
                                                        permissionMode: runOptions.permissionMode.rawValue, model: runOptions.model, effort: runOptions.effort, helperExecutable: helper, ccamExecutable: executable, baseEnvironment: environment)
             var extra: [String] = []
+            do { extra += try webMCPArguments?() ?? [] } catch { GlobalPool.clean(base); throw error }
             let store = ChatAttachmentStore(project: project)
             // File copies remain readable in resumed turns and after account handoff.
             // Each --add-dir scope contains only that one selected attachment.
@@ -723,9 +807,11 @@ final class ChatRuntime {
             receivedResult = false
             guard let message = event["message"] as? [String: Any] else { return }
             let content = message["content"] as? [[String: Any]] ?? []
-            for text in content.filter({ $0["type"] as? String == "text" }).compactMap({ $0["text"] as? String }) where !text.isEmpty {
+            for (index, block) in content.enumerated() where block["type"] as? String == "text" {
+                guard let text = block["text"] as? String, !text.isEmpty else { continue }
                 let messageID = message["id"] as? String ?? streamMessageID ?? UUID().uuidString
-                let existing = assistantIDs.first { key, id in
+                let streamedKey = messageID + ":block:\(index)"
+                let existing = assistantIDs[streamedKey] != nil && !finalizedAssistantKeys.contains(streamedKey) ? streamedKey : assistantIDs.first { key, id in
                     !finalizedAssistantKeys.contains(key) && key.hasPrefix(messageID + ":") && currentMessages.contains { $0.id == id && !$0.text.isEmpty && text.hasPrefix($0.text) }
                 }?.key
                 let key = existing ?? messageID + ":final:" + UUID().uuidString
@@ -770,8 +856,12 @@ final class ChatRuntime {
         }
     }
 
+    func isAssistantComplete(_ id: String) -> Bool {
+        !hasRunning || assistantIDs.contains { key, value in value == id && finalizedAssistantKeys.contains(key) }
+    }
+
     private func assistant(_ text: String, key: String, replace: Bool) {
-        if let id = assistantIDs[key] { updateMessage(id) { $0.text = replace ? text : $0.text + text }; lastAssistantID = id }
+        if let id = assistantIDs[key] { updateMessage(id) { let updated = replace ? text : $0.text + text; if updated != $0.text { $0.translatedText = nil }; $0.text = updated }; lastAssistantID = id }
         else {
             let message = ChatMessage(role: "assistant", text: text); assistantIDs[key] = message.id; lastAssistantID = message.id
             append(message)
@@ -867,7 +957,7 @@ final class ChatRuntime {
         saveTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { [weak self] _ in self?.saveTimer = nil; self?.persist() }
     }
     private func persist() {
-        do { try store.save(conversations, selectedID: selectedID) }
+        do { try saveMerged(conversations, selectedID: selectedID) }
         catch { stateText = "聊天记录保存失败：" + error.localizedDescription; onState?(stateText) }
     }
     private func state(_ text: String) { stateText = text; onState?(text); changed() }

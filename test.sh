@@ -65,3 +65,10 @@ else
   codesign --verify --deep --strict 'CCAM Desktop.app'
   plutil -lint 'CCAM Desktop.app/Contents/Info.plist'
 fi
+
+/usr/bin/python3 -B Tests/NativeTranslationTests.py
+
+swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" Source/WebMCP.swift Tests/WebMCPTests.swift -o .build-cache/web-mcp-tests
+.build-cache/web-mcp-tests
+# Real WebKit browser/proxy checks are opt-in for a graphical test session.
+if [[ "${CCAM_TEST_WEBKIT:-0}" == "1" ]]; then /bin/zsh Tests/web_browser_tests.sh; fi

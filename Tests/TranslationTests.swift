@@ -76,6 +76,92 @@ import Foundation
         wait { failure != nil }
         if case .failure = failure { check(true, "invalid worker output cannot be sent as a translation") }
         else { check(false, "invalid worker must fail") }
+        for (code, hint) in [("preservation_failed", "免译"), ("segment_too_long", "单段"), ("incomplete_result", "不完整"), ("unknown_private_error", "可重试")] {
+            let fixture = try worker("import sys,json\nprint(json.dumps({'error':'" + code + "'}))\nsys.exit(1)\n")
+            let service = LocalTranslator(home: root, workerURL: fixture, timeout: 2)
+            var result: Result<String, Error>?
+            service.translate("hello", from: .english, to: .chinese) { result = $0 }
+            wait { result != nil }
+            if case .failure(let error) = result { check(error.localizedDescription.contains(hint) && !error.localizedDescription.contains(code), "typed worker errors are actionable without leaking internal content") }
+            else { check(false, "error response cannot succeed") }
+        }
+        let nativeRoot = root.appendingPathComponent("external")
+        try fm.createDirectory(at: nativeRoot.appendingPathComponent("runtime/llama-b11871"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: nativeRoot.appendingPathComponent("models"), withIntermediateDirectories: true)
+        let server = nativeRoot.appendingPathComponent("runtime/llama-b11871/llama-server")
+        try Data("fixture".utf8).write(to: server); try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: server.path)
+        try Data().write(to: nativeRoot.appendingPathComponent("models/Hy-MT2-1.8B-Q8_0.gguf"))
+        try Data().write(to: root.appendingPathComponent("native_translation.py"))
+        try JSONSerialization.data(withJSONObject: ["engine": "Hy-MT2-1.8B-Q8_0", "dataRoot": nativeRoot.path]).write(to: root.appendingPathComponent("native.json"))
+        check(translator.usesNative && translator.isReady, "native pointer enables external model without deleting legacy runtime")
+        try fm.removeItem(at: nativeRoot)
+        check(!translator.isReady, "missing external model does not fall back to legacy engine")
+        var unavailable: Result<String, Error>?
+        translator.translate("hello", from: .english, to: .chinese) { unavailable = $0 }
+        wait { unavailable != nil }
+        if case .failure(let error) = unavailable { check(error.localizedDescription.contains("移动盘"), "missing disk has an actionable error") }
+        else { check(false, "missing disk must preserve original through failure") }
+        let fake = StreamingFixtureTranslator()
+        let streaming = StreamingReplyTranslation(translator: fake)
+        let intro = "Inspect the repository before deployment.\n\n"
+        let openCode = "```rust\nfn main() { println!(\"hello\"); }\n"
+        streaming.update(intro + openCode, complete: false)
+        wait { fake.jobs.count == 1 }
+        check(fake.jobs[0].text == intro, "live prose translates before the turn completes; open code stays buffered")
+        fake.jobs[0].finish(.success("部署前检查仓库。"))
+        check(streaming.preview!.contains("部署前检查仓库。") && streaming.preview!.contains("正在翻译"), "Chinese prefix appears while trailing content is still streaming")
+        let source = intro + openCode + "```\n\nKeep ～server-name～ unchanged."
+        streaming.update(source, complete: true)
+        wait { fake.jobs.count == 2 }
+        check(fake.jobs[1].text == String(source.dropFirst(intro.count)), "only the untranslated suffix is submitted, with complete code and exemption spans")
+        fake.jobs[1].finish(.success(openCode + "```\n\n保持 server-name 不变。"))
+        check(streaming.finished && streaming.source == source && streaming.translated.contains(openCode), "completed stream retains exact original and preserved code")
+        check(!streaming.translated.contains("正在翻译"), "transient progress never becomes the persisted translation")
+        check(StreamingReplyTranslation.stablePrefix("Keep ～name\nmore") == "", "open no-translate region is buffered across lines")
+        check(StreamingReplyTranslation.stablePrefix("Keep `some\ncode") == "", "open inline code stays buffered")
+        check(StreamingReplyTranslation.stablePrefix("| Name | Value |\n| --- | --- |\n| A | B |\n") == "", "streamed tables stay together until their boundary")
+        check(StreamingReplyTranslation.stablePrefix("| A | B |\n\nNext") == "| A | B |\n\n", "completed table is released as one unit")
+        check(StreamingReplyTranslation.stablePrefix("~~~rust\nlet x = 1;\n~~~\nTail") == "~~~rust\nlet x = 1;\n~~~\n", "tilde code fences are preserved while streaming")
+        let rewrite = StreamingReplyTranslation(translator: fake)
+        rewrite.update("Original reply.\n", complete: false); wait { fake.jobs.count == 3 }
+        rewrite.update("Corrected reply.\n", complete: true)
+        check(fake.jobs[2].cancelled, "a final source correction cancels stale inference")
+        fake.jobs[2].finish(.success("过期内容")); wait { fake.jobs.count == 4 }
+        check(!rewrite.translated.contains("过期"), "late result from replaced source cannot overwrite the corrected reply")
+        fake.jobs[3].finish(.failure(LocalTranslationError.failed))
+        check(rewrite.error != nil && rewrite.preview == nil, "failed live translation restores the original instead of hiding the reply")
+        let jobCount = fake.jobs.count
+        rewrite.update("Corrected reply.\n", complete: true)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        check(fake.jobs.count == jobCount, "translation failure does not create an automatic retry loop")
+        let cancelledStream = StreamingReplyTranslation(translator: fake)
+        cancelledStream.update("Cancelled text.\n", complete: false); wait { fake.jobs.count == jobCount + 1 }
+        cancelledStream.cancel(); fake.jobs.last!.finish(.success("不应出现"))
+        check(cancelledStream.translated.isEmpty && fake.jobs.last!.cancelled, "switching away cancels a live translation and rejects its callback")
+        let early = StreamingReplyTranslation(translator: fake)
+        var completedSignals = 0
+        early.onChange = { if early.finished { completedSignals += 1 } }
+        let priorCount = fake.jobs.count
+        early.update("A complete paragraph.\n", complete: false)
+        wait { fake.jobs.count == priorCount + 1 }
+        fake.jobs.last!.finish(.success("完整段落。"))
+        check(!early.finished, "translated chunks alone do not finalize a running source")
+        early.update("A complete paragraph.\n", complete: true)
+        check(early.finished && completedSignals == 1, "the final completion signal commits translation even when no untranslated tail remains")
         print("PASS: \(checks) offline translation service checks")
+    }
+}
+
+private final class StreamingFixtureTranslator: ChatTranslating {
+    final class Job {
+        let text: String
+        let finish: (Result<String, Error>) -> Void
+        var cancelled = false
+        init(text: String, finish: @escaping (Result<String, Error>) -> Void) { self.text = text; self.finish = finish }
+    }
+    var jobs: [Job] = []
+    func translate(_ text: String, from: TranslationLanguage, to: TranslationLanguage, completion: @escaping (Result<String, Error>) -> Void) -> TranslationRequest {
+        let job = Job(text: text, finish: completion); jobs.append(job)
+        return TranslationRequest { job.cancelled = true }
     }
 }

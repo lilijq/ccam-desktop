@@ -12,6 +12,7 @@ enum TranslationSetup {
 /// Retained independently of the chat view: switching projects cannot launch a
 /// second installer, lose progress or redirect installation to another folder.
 private final class TranslationSetupController: NSWindowController {
+    private let location = NSTextField(string: "")
     private let status = label("", size: 13, color: Theme.muted)
     private let install = ClosureButton("下载并安装", symbol: "arrow.down.circle") { }
     private let cancel = ClosureButton("取消", symbol: "xmark") { }
@@ -24,18 +25,28 @@ private final class TranslationSetupController: NSWindowController {
     private var terminationObserver: NSObjectProtocol?
 
     init() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 260), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 330), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "本机翻译"; window.isReleasedWhenClosed = false
         window.backgroundColor = Theme.background
         super.init(window: window)
         let host = ThemeSurface(Theme.background); window.contentView = host
         progress.style = .spinning; progress.controlSize = .small; progress.isDisplayedWhenStopped = false
-        let details = label("中英双向翻译，在本机运行。首次安装经当前代理下载 Argos 模型与运行组件；模型约 145 MB。", size: 12, color: Theme.muted)
+        let details = label("Hy-MT2 · 中英技术翻译 · Metal 加速。模型约 1.91 GB，保存在下方目录；仅安装时经代理下载，翻译不出本机。", size: 12, color: Theme.muted)
+        location.stringValue = LocalTranslator.shared.nativeDataRoot ?? "/Volumes/Mac/CCAM-Translation"
+        location.setAccessibilityLabel("翻译模型数据目录")
+        let choose = ClosureButton("选择目录", symbol: "folder") { [weak self] in
+            guard let self, self.process == nil, let window = self.window else { return }
+            let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
+            panel.canCreateDirectories = true; panel.allowsMultipleSelection = false
+            panel.beginSheetModal(for: window) { response in
+                if response == .OK, let url = panel.url { self.location.stringValue = url.path }
+            }
+        }
         let source = ClosureButton("开源项目", symbol: "arrow.up.right") {
-            NSWorkspace.shared.open(URL(string: "https://github.com/argosopentech/argos-translate")!)
+            NSWorkspace.shared.open(URL(string: "https://huggingface.co/tencent/Hy-MT2-1.8B")!)
         }
         let content = column([label("本机翻译", size: 23, weight: .semibold), details,
-                              row([progress, status], spacing: 8), row([source, spacer(), cancel, install], spacing: 8)], spacing: 18)
+                              row([location, choose], spacing: 8), row([progress, status], spacing: 8), row([source, spacer(), cancel, install], spacing: 8)], spacing: 18)
         content.translatesAutoresizingMaskIntoConstraints = false; host.addSubview(content)
         NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 24), content.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -24), content.topAnchor.constraint(equalTo: host.topAnchor, constant: 24)])
         for item in content.arrangedSubviews { item.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true }
@@ -59,14 +70,15 @@ private final class TranslationSetupController: NSWindowController {
     }
     private func refreshReady() {
         let ready = LocalTranslator.shared.isReady
-        status.stringValue = ready ? "已就绪 · 翻译无需联网" : "尚未安装中英翻译组件"
+        status.stringValue = LocalTranslator.shared.usesNative ? (ready ? "Hy-MT2 已就绪 · 原生离线运行" : "请连接模型所在移动盘") : "可升级为 Hy-MT2 技术翻译模型"
         status.textColor = ready ? Theme.success : Theme.muted
-        install.title = ready ? "已就绪" : "下载并安装"; install.isEnabled = !ready
+        install.title = LocalTranslator.shared.usesNative && ready ? "重新校验" : "下载并安装"; install.isEnabled = true
+        location.isEditable = true
         cancel.isHidden = true; progress.stopAnimation(nil)
     }
     private func start() {
         guard process == nil,
-              let script = Bundle.main.url(forResource: "setup_translation", withExtension: "py", subdirectory: "Translation"),
+              let script = Bundle.main.url(forResource: "setup_native_translation", withExtension: "py", subdirectory: "Translation"),
               let worker = Bundle.main.url(forResource: "translate_worker", withExtension: "py", subdirectory: "Translation") else {
             if process == nil { status.stringValue = "安装组件缺失，请更新 CCAM Desktop。"; status.textColor = Theme.warning }
             return
@@ -79,7 +91,7 @@ private final class TranslationSetupController: NSWindowController {
             // children too. Never interpolate paths into shell commands.
             let supervisor = """
             import os,signal,subprocess,sys,threading
-            os.setsid()
+            if os.getpgrp()!=os.getpid(): os.setsid()
             def stop(*unused):
                 signal.signal(signal.SIGTERM,signal.SIG_IGN)
                 threading.Timer(1,lambda: os.killpg(os.getpgrp(),signal.SIGKILL)).start()
@@ -87,7 +99,7 @@ private final class TranslationSetupController: NSWindowController {
             sys.exit(subprocess.call([sys.executable,'-I','-B']+sys.argv[1:]))
             """
             child.arguments = ["-I", "-c", supervisor, script.path,
-                               "--home", LocalTranslator.defaultHome.path, "--worker", worker.path]
+                               "--home", LocalTranslator.defaultHome.path, "--data-root", self.location.stringValue, "--worker", worker.path]
             var environment = ["HOME": FileManager.default.homeDirectoryForCurrentUser.path, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8"]
             for name in ExecutionProxy.proxyKeys + ["NO_PROXY", "no_proxy"] { environment[name] = proxy.environment[name] }
             child.environment = environment
@@ -108,12 +120,12 @@ private final class TranslationSetupController: NSWindowController {
             child.terminationHandler = { [weak self] child in DispatchQueue.main.async { self?.finish(id: id, code: child.terminationStatus) } }
             process = child; output = stdout; errors = stderr; attempt = id; interruption = nil
             try child.run()
-            install.isEnabled = false; cancel.isHidden = false; cancel.isEnabled = true
+            install.isEnabled = false; location.isEditable = false; cancel.isHidden = false; cancel.isEnabled = true
             progress.startAnimation(nil); status.stringValue = "正在准备翻译组件…"; status.textColor = Theme.muted
             let timeout = DispatchWorkItem { [weak self] in
                 guard self?.attempt == id else { return }; self?.stop(message: "安装超时，请检查代理后重试。")
             }
-            watchdog = timeout; DispatchQueue.main.asyncAfter(deadline: .now() + 600, execute: timeout)
+            watchdog = timeout; DispatchQueue.main.asyncAfter(deadline: .now() + 7200, execute: timeout)
         } catch {
             process = nil; attempt = nil; cleanupPipes()
             status.stringValue = error is ExecutionProxy.Failure ? error.localizedDescription : "无法启动安装，请确认已安装 Python 3.9 或更新版本。"
@@ -131,7 +143,7 @@ private final class TranslationSetupController: NSWindowController {
     private func finish(id: UUID, code: Int32) {
         guard attempt == id else { return }
         watchdog?.cancel(); watchdog = nil; attempt = nil; process = nil; cleanupPipes()
-        progress.stopAnimation(nil); cancel.isHidden = true
+        progress.stopAnimation(nil); cancel.isHidden = true; location.isEditable = true
         if interruption == nil && code == 0 && LocalTranslator.shared.isReady { refreshReady() }
         else {
             status.stringValue = interruption ?? "安装未完成，请检查代理和磁盘空间后重试。"

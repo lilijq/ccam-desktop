@@ -99,14 +99,15 @@ private final class ChatInputView: NSTextView {
 }
 
 /// Approval stays beside the composer, with the complete operation readable
-/// before a one-time decision. It never changes persistent permission rules.
+/// before an explicit decision; reusable tool grants are scoped to this project.
 final class ChatApprovalCard: ThemeSurface {
     let approveButton: ClosureButton
     let denyButton: ClosureButton
     let detailView = NSTextView()
+    let rememberChoice = NSButton(checkboxWithTitle: "", target: nil, action: nil)
 
     init(title: String, detail: String, actionTitle: String, canApprove: Bool,
-         approve: @escaping () -> Void, deny: @escaping () -> Void) {
+         approve: @escaping () -> Void, deny: @escaping () -> Void, rememberTool: String? = nil, approveRemembering: ((Bool) -> Void)? = nil) {
         approveButton = ClosureButton(actionTitle, symbol: "checkmark", action: approve)
         denyButton = ClosureButton("拒绝", symbol: "xmark", action: deny)
         super.init(Theme.panel, border: Theme.border, radius: 12)
@@ -124,10 +125,17 @@ final class ChatApprovalCard: ThemeSurface {
         approveButton.isEnabled = canApprove
         approveButton.bezelColor = Theme.primary; approveButton.contentTintColor = Theme.onPrimary
         approveButton.setAccessibilityLabel(actionTitle); denyButton.setAccessibilityLabel("拒绝这次操作")
-        let hint = label("仅本次", size: 11, color: Theme.muted)
-        let actions = row([hint, spacer(), denyButton, approveButton], spacing: 8)
+        rememberChoice.title = "记住此项目的 " + (rememberTool ?? "") + " 权限"
+        rememberChoice.font = Theme.font(size: 11); rememberChoice.state = .on
+        rememberChoice.toolTip = "此项目内后续调用同一工具将自动允许；包括不同命令或文件。可在权限模式菜单中清除。"
+        rememberChoice.setAccessibilityLabel(rememberChoice.title)
+        rememberChoice.isHidden = rememberTool == nil
+        if let approveRemembering {
+            approveButton.actionBlock = { [weak self] in approveRemembering(self?.rememberChoice.state == .on) }
+        }
+        let actions = row([spacer(), denyButton, approveButton], spacing: 8)
         let body = column([], spacing: 6)
-        for view in [heading, scroll, actions] { fillWidth(view, in: body) }
+        for view in [heading, scroll, rememberChoice, actions] { fillWidth(view, in: body) }
         body.translatesAutoresizingMaskIntoConstraints = false; addSubview(body)
         NSLayoutConstraint.activate([
             body.topAnchor.constraint(equalTo: topAnchor, constant: 12), body.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
@@ -204,12 +212,16 @@ final class ChatQuestionForm: NSView, NSTextFieldDelegate {
 /// the chat controller owns process, account, and conversation state.
 final class ProjectChatView: NSView, NSTextViewDelegate {
     let project: ProjectRecord
+    let boundConversationID: String?
+    var onNewConversationRequested: (() -> Void)?
+    var boundConversationUnavailable: Bool { boundConversationID != nil && (runtime == nil || runtime?.boundConversationUnavailable == true) }
     var onTerminalFallback: ((ChatTerminalTarget) throws -> Void)? { didSet { updateControls() } }
     var onShowTerminal: (() -> Void)? { didSet { updateControls() } }
     var onReturnFromTerminal: ((ChatTerminalTarget, @escaping (Result<ChatTerminalTarget, Error>) -> Void) -> Void)? { didSet { updateControls() } }
     var onStateChange: (() -> Void)?
     var onTurnFinished: (() -> Void)?
     var beforeStart: (([String]) throws -> Void)?
+    var webMCPArguments: (() throws -> [String])?
     var hasRunning: Bool { (runtime?.hasRunning ?? false) || outgoingTranslationID != nil }
     var historyItems: [(id: String, title: String)] {
         (runtime?.activeConversations ?? []).map { conversation in
@@ -243,6 +255,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     private var returnButton: ClosureButton!
     private var returningConversationID: String?
     private weak var conversationActionsAnchor: NSView?
+    private var conversationPresentingWindow: NSWindow? { window ?? conversationActionsAnchor?.window }
     private var attachButton: ClosureButton!
     private let attachments = AttachmentStrip()
     private var attachmentHeight: NSLayoutConstraint!
@@ -250,6 +263,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     private var previewPopover: NSPopover?
     private var drafts: [String: String] = [:]
     private var expandedTools: Set<String> = []
+    private var expandedProcesses: Set<String> = []
     private var renderedSignature = ""
     private var rendering = false
     private var renderRevision = 0
@@ -270,27 +284,37 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let options: ChatOptions
     }
     private var translationRetryDraft: TranslationRetryDraft?
+    private var streamingReplies: [String: StreamingReplyTranslation] = [:]
     private var replyRequests: [String: TranslationRequest] = [:]
     private var replyRequestIDs: [String: UUID] = [:]
     private var replyErrors: [String: String] = [:]
     private var expandedTranslations: Set<String> = []
     private var expandedSentTexts: Set<String> = []
 
-    init(project: ProjectRecord, translator: ChatTranslating = LocalTranslator.shared) {
+    static func createConversation(project: ProjectRecord) throws -> String {
+        try ChatStore(project: project).createConversation()
+    }
+
+    init(project: ProjectRecord, conversationID: String? = nil, translator: ChatTranslating = LocalTranslator.shared, controller: ChatRuntime? = nil) {
         self.project = project; self.translator = translator
+        self.boundConversationID = conversationID ?? controller?.boundConversationID
         super.init(frame: .zero)
         buildInterface()
         registerForDraggedTypes([.fileURL, .png, .tiff])
         do {
-            let controller = try ChatRuntime(project: project)
+            let controller = try controller ?? ChatRuntime(project: project, conversationID: conversationID)
+            if let boundConversationID, controller.selectedID != boundConversationID {
+                throw AppError.message("对话面板与会话不匹配，未打开其他对话。")
+            }
             runtime = controller
             controller.onChange = { [weak self] in self?.refresh() }
             controller.onTurnFinished = { [weak self] in
                 self?.translateCompletedReplies()
                 self?.onTurnFinished?()
             }
+            controller.webMCPArguments = { [weak self] in try self?.webMCPArguments?() ?? [] }
             controller.beforeStart = { [weak self] arguments in try self?.beforeStart?(arguments) }
-            if controller.selectedID == nil { controller.createConversation() }
+            if controller.selectedID == nil, boundConversationID == nil { controller.createConversation() }
         } catch { startupError = OperationPresentation.clean(error.localizedDescription) }
         refresh()
     }
@@ -298,12 +322,14 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     deinit {
         outgoingTranslation?.cancel()
         replyRequests.values.forEach { $0.cancel() }
+        streamingReplies.values.forEach { $0.cancel() }
     }
 
     private func buildInterface() {
         history.hasVerticalScroller = true; history.hasHorizontalScroller = false
         history.autohidesScrollers = true
         history.drawsBackground = false; history.borderType = .noBorder
+        history.wantsLayer = true; document.wantsLayer = true
         history.documentView = document
         history.translatesAutoresizingMaskIntoConstraints = false; addSubview(history)
         document.translatesAutoresizingMaskIntoConstraints = false
@@ -368,6 +394,9 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         effortPicker.target = self; effortPicker.action = #selector(effortChanged)
         permissionPicker.addItems(withTitles: ["默认模式", "计划模式", "Auto 模式", "允许编辑"])
         for (item, value) in zip(permissionPicker.itemArray, ["default", "plan", "auto", "acceptEdits"]) { item.representedObject = value }
+        permissionPicker.menu?.addItem(.separator())
+        let clearPermissions = NSMenuItem(title: "清除记住的权限", action: nil, keyEquivalent: "")
+        clearPermissions.tag = 99; permissionPicker.menu?.addItem(clearPermissions)
         permissionPicker.showsMode = true
         for (picker, width) in [(modelPicker, 86.0), (effortPicker, 64.0), (permissionPicker, 74.0)] {
             picker.widthAnchor.constraint(equalToConstant: width).isActive = true
@@ -513,6 +542,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     private func cancelReplyTranslations() {
+        streamingReplies.values.forEach { $0.cancel() }; streamingReplies.removeAll()
         replyRequestIDs.removeAll()
         let requests = replyRequests; replyRequests.removeAll()
         requests.values.forEach { $0.cancel() }
@@ -599,6 +629,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     func newConversation() {
+        if boundConversationID != nil { onNewConversationRequested?(); return }
         guard let runtime else { return }
         guard !runtime.hasRunning else {
             showError("请先停止当前任务，再新建对话。", window: window); return
@@ -615,6 +646,10 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         defer { rendering = false }
         let selectedID = runtime?.selectedID
         let changedConversation = displayedID != selectedID
+        if boundConversationUnavailable {
+            cancelOutgoingTranslation(); cancelReplyTranslations()
+            translationStatus = nil; translationFailed = false
+        }
         if changedConversation {
             cancelOutgoingTranslation(); cancelReplyTranslations()
             translationStatus = nil; translationFailed = false
@@ -627,10 +662,11 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         refreshOptions()
         refreshAttachments()
         refreshApprovals()
+        updateStreamingReplies()
         let visible = (runtime?.currentMessages ?? []).map { message in
             DisplayMessage(id: message.id, role: message.role, text: message.text,
                            title: message.toolName.map(toolTitle), isError: message.role == "error", attachments: message.attachments ?? [],
-                           originalText: message.originalText, translatedText: message.translatedText)
+                           originalText: message.originalText, translatedText: streamingReplies[message.id]?.preview ?? message.translatedText)
         }
         displayMessages(visible, conversationID: selectedID ?? "", scrollToEnd: changedConversation)
         updateControls()
@@ -653,7 +689,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let count = pending.count > 1 ? " · \(pending.count) 项待确认" : ""
         let title: String, actionTitle: String
         switch request.kind {
-        case .tool: title = toolTitle(request.toolName) + count; actionTitle = "允许一次"
+        case .tool: title = toolTitle(request.toolName) + count; actionTitle = "允许"
         case .question: title = "需要你的回答" + count; actionTitle = "回答问题"
         case .plan: title = "确认执行计划" + count; actionTitle = "同意计划"
         }
@@ -662,14 +698,18 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             guard let self else { return }
             if request.kind == .question { self.showQuestion(request) }
             else { self.respondToApproval(id: request.id, allow: true) }
-        }, deny: { [weak self] in self?.respondToApproval(id: request.id, allow: false) })
+        }, deny: { [weak self] in self?.respondToApproval(id: request.id, allow: false) },
+            rememberTool: runtime?.mayRemember(request) == true ? request.toolName : nil,
+            approveRemembering: request.kind == .tool ? { [weak self] remember in
+                self?.respondToApproval(id: request.id, allow: true, remember: remember && self?.runtime?.mayRemember(request) == true)
+            } : nil)
         fillWidth(card, in: approvalArea)
     }
 
-    private func respondToApproval(id: String, allow: Bool) {
+    private func respondToApproval(id: String, allow: Bool, remember: Bool = false) {
         guard let runtime else { return }
         do {
-            if allow { try runtime.approve(id: id) } else { try runtime.deny(id: id) }
+            if allow { try runtime.approve(id: id, remember: remember) } else { try runtime.deny(id: id) }
         } catch { showError(OperationPresentation.clean(error.localizedDescription), window: window) }
         refresh()
     }
@@ -708,6 +748,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let active = hasRunning
         let needsInteraction = runtime?.needsTerminalInteraction ?? false
         let transferred = runtime?.currentConversationTransferred ?? false
+        let available = runtime != nil && !boundConversationUnavailable
         if let retry = translationRetryDraft,
            retry.conversationID != runtime?.selectedID || retry.text != input.string ||
            retry.attachmentIDs != runtime?.currentAttachments.map(\.id) || retry.options != runtime?.currentOptions {
@@ -716,21 +757,21 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let canRetryTranslation = translationRetryDraft != nil && !active && !transferred && (runtime?.currentOptions.translateToEnglish ?? true)
         retryTranslationButton.isHidden = !canRetryTranslation
         retryTranslationButton.isEnabled = canRetryTranslation
-        sendButton.isEnabled = runtime != nil && !active && !transferred && (!input.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || runtime?.currentAttachments.isEmpty == false)
+        sendButton.isEnabled = available && !active && !transferred && (!input.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || runtime?.currentAttachments.isEmpty == false)
         sendButton.isHidden = active
         stopButton.isHidden = !active
-        permissionPicker.isEnabled = runtime != nil && !active && !transferred
+        permissionPicker.isEnabled = available && !active && !transferred
         modelPicker.isEnabled = permissionPicker.isEnabled
         effortPicker.isEnabled = permissionPicker.isEnabled
-        attachButton.isEnabled = runtime != nil && !active && !transferred
-        translationButton.isEnabled = runtime != nil && !active && !transferred
+        attachButton.isEnabled = available && !active && !transferred
+        translationButton.isEnabled = available && !active && !transferred
         stopButton.setAccessibilityLabel(outgoingTranslationID == nil ? "停止当前任务" : "取消翻译")
         stopButton.toolTip = outgoingTranslationID == nil ? "停止当前任务" : "取消翻译，保留草稿"
         // A terminal handoff owns execution, not the user's draft. Keep typing
         // available while requiring an explicit, completed handback to Send.
-        input.isEditable = runtime != nil
+        input.isEditable = available
         input.isSelectable = true
-        input.placeholder = transferred ? "可以先写草稿，返回聊天后发送…" : "描述任务，或继续提问…"
+        input.placeholder = boundConversationUnavailable ? "这段对话已删除" : transferred ? "可以先写草稿，返回聊天后发送…" : "描述任务，或继续提问…"
         fallbackButton.title = transferred ? "打开终端" : "在终端继续"
         fallbackButton.isHidden = transferred ? onShowTerminal == nil : (!needsInteraction || onTerminalFallback == nil)
         fallbackButton.isEnabled = !active && returningConversationID == nil
@@ -744,7 +785,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let needsStatus = !status.stringValue.isEmpty && !idleStates.contains(status.stringValue)
         let showsState = active || needsInteraction || transferred || startupError != nil || needsStatus
         status.isHidden = !showsState; stateLine.isHidden = !showsState; collapsedState.isActive = !showsState
-        emptyState.isHidden = !(runtime?.currentMessages.isEmpty == true && !active && startupError == nil)
+        emptyState.isHidden = boundConversationUnavailable || !(runtime?.currentMessages.isEmpty == true && !active && startupError == nil)
     }
 
     private func saveDraft() {
@@ -759,11 +800,15 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     func selectConversation(id: String) {
+        guard boundConversationID == nil || boundConversationID == id else { return }
         guard let runtime, !runtime.hasRunning, runtime.activeConversations.contains(where: { $0.id == id }) else { return }
         saveDraft(); runtime.select(id: id); refresh(); focusInput()
     }
 
+    func reloadConversationIndex() { runtime?.reloadConversationIndex() }
+
     private func refreshOptions() {
+        permissionPicker.itemArray.first { $0.tag == 99 }?.title = "清除记住的权限（\(runtime?.rememberedTools.count ?? 0)）"
         let settings = runtime?.currentOptions ?? ChatOptions()
         if let item = permissionPicker.itemArray.first(where: { $0.representedObject as? String == settings.permissionMode.rawValue }) { permissionPicker.select(item) }
         if let item = effortPicker.itemArray.first(where: { $0.representedObject as? String == (settings.effort ?? "") }) { effortPicker.select(item) }
@@ -782,7 +827,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let automatic = settings.autoTranslateReplies ?? true
         translationButton.title = enabled ? "中→EN" : "翻译"
         translationButton.setAccessibilityLabel("翻译设置")
-        translationButton.toolTip = "中文转英文发送：" + (enabled ? "开" : "关") + "；自动显示中文：" + (automatic ? "开" : "关") + "。在本机翻译，保留原文。"
+        translationButton.toolTip = "中文转英文发送：" + (enabled ? "开" : "关") + "；自动显示中文：" + (automatic ? "开" : "关") + "。在本机翻译，保留原文。\n～内容～ 或 ～～内容～～ 内不翻译，结果去掉标记，支持换行。"
         translationButton.needsDisplay = true
         modelPicker.needsDisplay = true; effortPicker.needsDisplay = true; permissionPicker.needsDisplay = true
     }
@@ -833,7 +878,14 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         refreshOptions()
     }
 
-    @objc private func permissionChanged() { saveOptions(model: runtime?.currentOptions.model) }
+    @objc private func permissionChanged() {
+        if permissionPicker.selectedItem?.tag == 99 {
+            do { try runtime?.clearRememberedPermissions() }
+            catch { showError(error.localizedDescription, window: window) }
+            refreshOptions(); return
+        }
+        saveOptions(model: runtime?.currentOptions.model)
+    }
 
     @objc private func modelChanged() {
         let model = modelPicker.selectedItem?.representedObject as? String ?? ""
@@ -853,8 +905,13 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     func showConversationActions(id: String, from sender: NSView) {
-        guard let runtime, !runtime.hasRunning else { return }
         conversationActionsAnchor = sender
+        conversationActionsMenu(id: id, from: sender)?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    func conversationActionsMenu(id: String, from sender: NSView? = nil) -> NSMenu? {
+        if let sender { conversationActionsAnchor = sender }
+        guard let runtime, !runtime.hasRunning else { return nil }
         let menu = NSMenu()
         func add(_ title: String, tag: Int, symbol: String) {
             let item = NSMenuItem(title: title, action: #selector(conversationAction(_:)), keyEquivalent: "")
@@ -872,7 +929,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         }
         menu.addItem(.separator())
         add("已删除的对话", tag: 5, symbol: "arrow.uturn.backward")
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+        return menu
     }
 
     @objc private func effortChanged() {
@@ -896,13 +953,13 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         case 4:
             saveDraft()
             do { try runtime.deleteConversation(id: id); refresh() }
-            catch { showError(error.localizedDescription, window: window) }
+            catch { showError(error.localizedDescription, window: conversationPresentingWindow) }
         default: break
         }
     }
 
     private func renameConversation(_ conversation: ChatConversation) {
-        guard let window else { return }
+        guard let window = conversationPresentingWindow else { return }
         let alert = NSAlert(); alert.messageText = "重命名对话"
         let field = NSTextField(string: conversation.title)
         field.frame = NSRect(x: 0, y: 0, width: 320, height: 28); alert.accessoryView = field
@@ -910,13 +967,14 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .alertFirstButtonReturn else { return }
             do { try self.runtime?.renameConversation(id: conversation.id, title: field.stringValue) }
-            catch { showError(error.localizedDescription, window: self.window) }
+            catch { showError(error.localizedDescription, window: self.conversationPresentingWindow) }
         }
         window.makeFirstResponder(field)
     }
 
     func showDeletedConversations(from sender: NSView) {
-        guard let runtime, !runtime.hasRunning else { return }
+        guard let runtime else { return }
+        conversationActionsAnchor = sender
         let menu = NSMenu(); menu.autoenablesItems = false
         let heading = NSMenuItem(title: runtime.deletedConversations.isEmpty ? "没有已删除的对话" : "选择对话恢复", action: nil, keyEquivalent: "")
         heading.isEnabled = false; menu.addItem(heading)
@@ -930,7 +988,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     @objc private func restoreConversation(_ item: NSMenuItem) {
         guard let id = item.representedObject as? String else { return }
         do { try runtime?.restoreConversation(id: id); refresh() }
-        catch { showError(error.localizedDescription, window: window) }
+        catch { showError(error.localizedDescription, window: conversationPresentingWindow) }
     }
 
     private func markdown(_ conversation: ChatConversation) -> String {
@@ -945,7 +1003,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     private func exportConversation(_ conversation: ChatConversation) {
-        guard let window else { return }
+        guard let window = conversationPresentingWindow else { return }
         let panel = NSSavePanel(); panel.title = "导出对话"; panel.prompt = "导出"
         panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
         let safeTitle = conversation.title.components(separatedBy: CharacterSet(charactersIn: "/:\n\r")).joined(separator: " ")
@@ -954,7 +1012,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         panel.beginSheetModal(for: window) { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             do { try text.write(to: url, atomically: true, encoding: .utf8) }
-            catch { showError(error.localizedDescription, window: self?.window) }
+            catch { showError(error.localizedDescription, window: self?.conversationPresentingWindow) }
         }
     }
 
@@ -968,9 +1026,9 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             sendPrepared(text: text, originalText: nil, draft: rawInput); return
         }
         let source = text.isEmpty ? "Please review the attached files." : text
-        let needsTranslation = source.unicodeScalars.contains { (0x3400...0x9FFF).contains($0.value) || (0x20000...0x3134F).contains($0.value) }
+        let needsTranslation = source.contains("～") || source.unicodeScalars.contains { (0x3400...0x9FFF).contains($0.value) || (0x20000...0x3134F).contains($0.value) }
         guard needsTranslation else {
-            sendPrepared(text: englishPrompt(source), originalText: text.isEmpty ? "请查看附件。" : text, draft: rawInput); return
+            sendPrepared(text: source, originalText: text.isEmpty ? "请查看附件。" : text, draft: rawInput); return
         }
         let requestID = UUID(), conversationID = runtime.selectedID
         let attachmentIDs = runtime.currentAttachments.map(\.id)
@@ -989,7 +1047,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             do {
                 let translated = try result.get().trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !translated.isEmpty else { throw AppError.message("翻译结果为空，请重试。") }
-                self.sendPrepared(text: self.englishPrompt(translated), originalText: text, draft: rawInput)
+                self.sendPrepared(text: translated, originalText: text, draft: rawInput)
             } catch {
                 self.translationStatus = "翻译未完成：" + OperationPresentation.clean(error.localizedDescription)
                 self.translationRetryDraft = TranslationRetryDraft(conversationID: conversationID, text: rawInput, attachmentIDs: attachmentIDs, options: options)
@@ -998,11 +1056,6 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         }
         // A test or cached translator may complete synchronously.
         if outgoingTranslationID == requestID { outgoingTranslation = request }
-    }
-
-    private func englishPrompt(_ text: String) -> String {
-        let instruction = "Please respond in English."
-        return text.hasSuffix(instruction) ? text : text + "\n\n" + instruction
     }
 
     private func sendPrepared(text: String, originalText: String?, draft: String) {
@@ -1018,6 +1071,44 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         refresh(); focusInput()
     }
 
+    private func processMessageIDs(_ items: [(String, String)]) -> Set<String> {
+        var result = Set<String>(), sawTool = false
+        for (id, role) in items.reversed() {
+            if role == "user" { sawTool = false }
+            else if role == "tool" { sawTool = true; result.insert(id) }
+            else if role == "assistant" && sawTool { result.insert(id) }
+        }
+        return result
+    }
+
+    private func updateStreamingReplies() {
+        guard let runtime, runtime.currentOptions.autoTranslateReplies ?? true,
+              let conversationID = runtime.selectedID,
+              let lastUser = runtime.currentMessages.lastIndex(where: { $0.role == "user" }) else { return }
+        let processIDs = processMessageIDs(runtime.currentMessages.map { ($0.id, $0.role) })
+        for id in processIDs { streamingReplies.removeValue(forKey: id)?.cancel() }
+        for message in runtime.currentMessages.suffix(from: lastUser + 1) where message.role == "assistant" && !message.text.isEmpty && !processIDs.contains(message.id) {
+            if streamingReplies[message.id] == nil && runtime.hasRunning && message.translatedText == nil && replyErrors[message.id] == nil {
+                let stream = StreamingReplyTranslation(translator: translator)
+                streamingReplies[message.id] = stream
+                stream.onChange = { [weak self, weak stream] in
+                    guard let self, let stream, self.runtime?.selectedID == conversationID,
+                          self.streamingReplies[message.id] === stream else { return }
+                    if let error = stream.error {
+                        self.replyErrors[message.id] = error.localizedDescription
+                        self.streamingReplies[message.id] = nil
+                    } else if stream.finished {
+                        self.streamingReplies[message.id] = nil
+                        do { try self.runtime?.saveTranslation(messageID: message.id, sourceText: stream.source, text: stream.translated) }
+                        catch { self.replyErrors[message.id] = error.localizedDescription }
+                    }
+                    self.renderedSignature = ""; self.refresh()
+                }
+            }
+            streamingReplies[message.id]?.update(message.text, complete: runtime.isAssistantComplete(message.id))
+        }
+    }
+
     private func translateCompletedReplies() {
         guard let runtime, runtime.currentOptions.autoTranslateReplies ?? true,
               runtime.stateText.hasPrefix("已完成") || runtime.stateText.hasPrefix("本轮结束") else { return }
@@ -1027,18 +1118,20 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     private func translateLatestReplies() {
         guard let runtime, !runtime.hasRunning,
               let lastUser = runtime.currentMessages.lastIndex(where: { $0.role == "user" }) else { return }
-        for message in runtime.currentMessages.suffix(from: lastUser + 1) where message.role == "assistant" && !message.text.isEmpty && message.translatedText == nil {
+        let processIDs = processMessageIDs(runtime.currentMessages.map { ($0.id, $0.role) })
+        for message in runtime.currentMessages.suffix(from: lastUser + 1) where message.role == "assistant" && !processIDs.contains(message.id) && !message.text.isEmpty && message.translatedText == nil && streamingReplies[message.id] == nil && replyErrors[message.id] == nil {
             beginReplyTranslation(id: message.id, source: message.text, revealTranslation: false)
         }
     }
 
     private func translateReply(id: String, source: String) {
-        guard let runtime, !runtime.hasRunning,
+        guard let runtime,
               runtime.currentMessages.contains(where: { $0.id == id && $0.role == "assistant" && $0.text == source }) else { return }
-        if runtime.currentMessages.first(where: { $0.id == id })?.translatedText != nil {
+        if runtime.currentMessages.first(where: { $0.id == id })?.translatedText != nil || streamingReplies[id] != nil {
             if expandedTranslations.contains(id) { expandedTranslations.remove(id) } else { expandedTranslations.insert(id) }
             renderedSignature = ""; refresh(); return
         }
+        guard !runtime.hasRunning else { return }
         beginReplyTranslation(id: id, source: source, revealTranslation: !(runtime.currentOptions.autoTranslateReplies ?? true))
     }
 
@@ -1091,7 +1184,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             toggle.setAccessibilityLabel((expanded ? "折叠" : "展开") + name)
             let body = column([toggle], spacing: 7)
             if expanded {
-                let detail = messageText(text, color: isError ? Theme.warning : Theme.muted)
+                let detail = ChatMarkdown.field(NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular), .foregroundColor: isError ? Theme.warning : Theme.muted]))
                 fillWidth(detail, in: body)
             }
             fillWidth(body, in: messages)
@@ -1122,14 +1215,32 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         }
         if role == "assistant", !isError, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let pending = replyRequestIDs[id] != nil
+            let streaming = streamingReplies[id] != nil
             let expanded = expandedTranslations.contains(id)
             let translate = ClosureButton(pending ? "翻译中…" : "", symbol: "character.bubble") { [weak self] in self?.translateReply(id: id, source: text) }
             translate.isBordered = false; translate.font = Theme.font(size: 11)
-            translate.isEnabled = runtime?.hasRunning != true && !pending
+            translate.isEnabled = !pending && (runtime?.hasRunning != true || streaming || translatedText != nil)
             translate.toolTip = showsChinese ? (expanded ? "收起英文原文" : "查看英文原文") : (expanded ? "收起中文翻译" : "在本机翻译为中文，保留英文原文")
             translate.setAccessibilityLabel(pending ? "正在翻译回复" : showsChinese ? (expanded ? "收起英文原文" : "查看英文原文") : (expanded ? "收起中文翻译" : "翻译回复为中文"))
             if !pending { translate.widthAnchor.constraint(equalToConstant: 30).isActive = true }
-            let footer = row([translate], spacing: 8)
+            let copy = ClosureButton("", symbol: "doc.on.doc") { }
+            copy.actionBlock = { [weak copy, weak self] in
+                ChatOriginalCopy.write(self?.runtime?.currentMessages.first { $0.id == id }?.text ?? text)
+                copy?.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "已复制")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak copy] in
+                    copy?.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制原文")
+                }
+            }
+            copy.isBordered = false; copy.widthAnchor.constraint(equalToConstant: 30).isActive = true
+            copy.setAccessibilityLabel("复制原文"); copy.toolTip = "复制完整原文（包含 Markdown 与代码）"
+            let retranslate = ClosureButton("", symbol: "arrow.clockwise") { [weak self] in
+                self?.beginReplyTranslation(id: id, source: text, revealTranslation: false)
+            }
+            retranslate.isBordered = false; retranslate.widthAnchor.constraint(equalToConstant: 30).isActive = true
+            retranslate.isEnabled = runtime?.hasRunning != true && !pending
+            retranslate.setAccessibilityLabel("重新翻译原文"); retranslate.toolTip = "用当前本机模型重新翻译，失败时保留现有内容"
+            retranslate.isHidden = translatedText == nil
+            let footer = row([translate, copy, retranslate], spacing: 8)
             if let error = replyErrors[id] {
                 let detail = label(error, size: 11, color: Theme.warning); detail.maximumNumberOfLines = 2; detail.toolTip = error
                 footer.addArrangedSubview(detail)
@@ -1156,14 +1267,8 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         } else { fillWidth(body, in: messages) }
     }
 
-    private func messageText(_ text: String, color: NSColor) -> NSTextField {
-        let field = label(text.isEmpty ? "…" : text, size: 15, color: color)
-        field.isSelectable = true; field.maximumNumberOfLines = 0; field.lineBreakMode = .byWordWrapping
-        let paragraph = NSMutableParagraphStyle(); paragraph.minimumLineHeight = 22; paragraph.maximumLineHeight = 22; paragraph.paragraphSpacing = 8
-        field.attributedStringValue = NSAttributedString(string: field.stringValue, attributes: [
-            .font: Theme.font(size: 15), .foregroundColor: color, .paragraphStyle: paragraph
-        ])
-        return field
+    private func messageText(_ text: String, color: NSColor) -> NSView {
+        ChatMarkdownView(text.isEmpty ? "…" : text, color: color)
     }
 
     private struct DisplayMessage {
@@ -1179,10 +1284,10 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
 
     private func displayMessages(_ items: [DisplayMessage], conversationID: String, scrollToEnd: Bool = false) {
         let messageSignatures = items.map { item in
-            [item.id, item.role, item.text, item.title ?? "", String(item.isError), item.attachments.map(\.id).joined(), item.originalText ?? "", item.translatedText ?? ""].joined(separator: "\u{1e}")
+            [item.id, item.role, (item.role == "assistant" && item.translatedText != nil && (runtime?.currentOptions.autoTranslateReplies ?? true) && !expandedTranslations.contains(item.id)) ? "" : item.text, item.title ?? "", String(item.isError), item.attachments.map(\.id).joined(), item.originalText ?? "", item.translatedText ?? ""].joined(separator: "\u{1e}")
         }
         let signature = ([conversationID] + messageSignatures + [
-            expandedTools.sorted().joined(), expandedTranslations.sorted().joined(), expandedSentTexts.sorted().joined(),
+            expandedTools.sorted().joined(), expandedProcesses.sorted().joined(), expandedTranslations.sorted().joined(), expandedSentTexts.sorted().joined(),
             replyRequestIDs.keys.sorted().joined(), String(runtime?.hasRunning ?? false), String(runtime?.currentOptions.autoTranslateReplies ?? true)
         ]).joined(separator: "\u{1f}")
         guard signature != renderedSignature else { return }
@@ -1190,7 +1295,33 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let previousOffset = history.contentView.bounds.origin.y
         let followsOutput = scrollToEnd || document.bounds.height - history.contentView.bounds.maxY < 80
         for view in messages.arrangedSubviews { messages.removeArrangedSubview(view); view.removeFromSuperview() }
+        let processIDs = processMessageIDs(items.map { ($0.id, $0.role) })
+        var turn = "initial", toolsByTurn: [String: [DisplayMessage]] = [:], turnForID: [String: String] = [:]
+        for item in items {
+            if item.role == "user" { turn = item.id }
+            turnForID[item.id] = turn
+            if processIDs.contains(item.id) { toolsByTurn[turn, default: []].append(item) }
+        }
+        var shownProcesses = Set<String>()
         for message in items {
+            if processIDs.contains(message.id) {
+                let key = turnForID[message.id] ?? "initial"
+                guard shownProcesses.insert(key).inserted else { continue }
+                let operations = toolsByTurn[key] ?? []
+                let expanded = expandedProcesses.contains(key)
+                let toggle = ClosureButton("执行过程 · \(operations.filter { $0.role == "tool" }.count) 项", symbol: expanded ? "chevron.down" : "chevron.right") { [weak self] in
+                    guard let self else { return }
+                    if self.expandedProcesses.contains(key) { self.expandedProcesses.remove(key) } else { self.expandedProcesses.insert(key) }
+                    self.renderedSignature = ""; self.refresh()
+                }
+                toggle.isBordered = false; toggle.font = Theme.font(size: 11); toggle.contentTintColor = Theme.muted
+                toggle.setAccessibilityLabel(expanded ? "折叠执行过程" : "展开执行过程")
+                fillWidth(row([toggle, spacer()], spacing: 0), in: messages)
+                if expanded {
+                    for operation in operations { addMessage(id: operation.id, role: operation.role, text: operation.text, title: operation.title, isError: operation.isError, translatedText: operation.translatedText) }
+                }
+                continue
+            }
             if message.role == "user", let previous = messages.arrangedSubviews.last { messages.setCustomSpacing(32, after: previous) }
             addMessage(id: message.id, role: message.role, text: message.text, title: message.title, isError: message.isError, attachments: message.attachments, originalText: message.originalText, translatedText: message.translatedText)
         }
@@ -1214,5 +1345,12 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         if let window {
             alert.beginSheetModal(for: window) { response in if response == .alertFirstButtonReturn { create() } }
         } else if alert.runModal() == .alertFirstButtonReturn { create() }
+    }
+}
+
+
+enum ChatOriginalCopy {
+    static func write(_ text: String, to pasteboard: NSPasteboard = .general) {
+        pasteboard.clearContents(); pasteboard.setString(text, forType: .string)
     }
 }

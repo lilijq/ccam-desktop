@@ -76,7 +76,7 @@ enum WorkspaceSidebarUITests {
         check(button(beta.title) != nil, "an explicit new-conversation action can reveal its project")
         var runningGroups = changed; runningGroups[0].running = true
         sidebar.update(groups: runningGroups, currentID: records[1].id)
-        check(button(alpha.title)?.isEnabled == false && button(beta.title)?.isEnabled == true, "a running project does not disable other projects' conversations")
+        check(button(alpha.title)?.isEnabled == true && button(beta.title)?.isEnabled == true, "running tasks keep navigation available within their project and across projects")
         sidebar.update(groups: changed, currentID: records[1].id); host.layoutSubtreeIfNeeded()
         let title = button(beta.title)!, more = button("对话操作：" + beta.title)!
         check(title.bounds.width > 130 && abs(title.bounds.width + more.bounds.width - title.superview!.bounds.width) < 1, "nested conversation titles fill their row beside the action button")
