@@ -1,0 +1,48 @@
+name: macOS build and tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned CCAM for isolated integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64) arch=arm64; checksum=5c6308fb8b894566bf558bc72c5897688928125544c7fd04bae3e8ea07eec60d ;;
+            x86_64) arch=amd64; checksum=bfc11ba89fbdaf91e7ae9511a61e501c6913a69481567329a20fb2df706170ce ;;
+            *) echo "Unsupported runner architecture"; exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/ccam.tar.gz"
+          curl --fail --location --retry 2 "https://github.com/jhyunwoo/ccam/releases/download/v0.11.0/ccam_darwin_${arch}.tar.gz" -o "$archive"
+          printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" ccam
+          chmod +x "$HOME/.local/bin/ccam"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build native application
+        run: ./build.sh
+      - name: Run isolated tests
+        run: ./test.sh
+      - name: Upload ad-hoc signed development build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: CCAM-Desktop-${{ runner.arch }}
+          path: CCAM Desktop.app.zip
+          if-no-files-found: error
+          retention-days: 14

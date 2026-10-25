@@ -1,0 +1,23 @@
+# Build outputs
+.build-cache/
+*.app/
+*.app.zip
+*.zip
+*.dSYM/
+
+# Machine-specific artifacts and working notes
+/桌面验收/
+/设计图纸/
+/*.txt
+.DS_Store
+._*
+*.log
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.credentials.json
+browser-locks.json
+projects.json
+chats/
