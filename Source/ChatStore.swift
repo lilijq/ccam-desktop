@@ -11,6 +11,8 @@ struct ChatOptions: Codable, Equatable {
     var model: String? = nil
     var permissionMode: ChatPermissionMode = .default
     var effort: String? = nil
+    var translateToEnglish: Bool? = nil
+    var autoTranslateReplies: Bool? = nil
 }
 
 struct ChatMessage: Identifiable, Codable, Equatable {
@@ -19,6 +21,8 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var text: String
     var toolName: String? = nil
     var attachments: [ChatAttachment]? = nil
+    var originalText: String? = nil
+    var translatedText: String? = nil
 }
 
 struct ChatConversation: Identifiable, Codable, Equatable {
@@ -77,7 +81,12 @@ final class ChatStore {
     func save(_ conversations: [ChatConversation], selectedID: String?) throws {
         let safeConversations = conversations.map { conversation -> ChatConversation in
             var copy = conversation; copy.title = Self.redacted(copy.title)
-            copy.messages = copy.messages.map { message in var copy = message; copy.text = Self.redacted(copy.text); return copy }
+            copy.messages = copy.messages.map { message in
+                var copy = message; copy.text = Self.redacted(copy.text)
+                copy.originalText = copy.originalText.map(Self.redacted)
+                copy.translatedText = copy.translatedText.map(Self.redacted)
+                return copy
+            }
             return copy
         }
         let active = safeConversations.filter { $0.deletedAt == nil }

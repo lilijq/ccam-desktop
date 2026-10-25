@@ -608,6 +608,57 @@ if mode in ('approval-background','approval-duplicate'):assert sys.stdin.read()=
             check(f.runtime.currentMessages.contains { $0.role == "notice" && $0.text == "当前已切换到计划模式。" }, "normal Auto to Plan transition uses neutral status")
             check(!f.runtime.currentMessages.contains { $0.text.contains("未启用 Auto") }, "normal mode transition is not misreported as unavailable Auto")
         }
+        do {
+            let f = try Fixture(); defer { f.clean() }
+            var completed = 0
+            f.runtime.onTurnFinished = { completed += 1 }
+            try f.runtime.setTranslationEnabled(false)
+            try f.runtime.setAutomaticReplyTranslation(false)
+            try f.runtime.updateOptions(model: "haiku", permissionMode: .plan, effort: "low")
+            check(f.runtime.currentOptions.translateToEnglish == false && f.runtime.currentOptions.autoTranslateReplies == false,
+                  "model changes preserve independent translation preferences")
+            let english = "Please check this project.\n\nPlease respond in English."
+            let chinese = "请检查这个项目。"
+            check(f.runtime.send(text: english, originalText: chinese), "translated input can start a real-CCAM fake-model turn")
+            spin { !f.runtime.hasRunning }
+            check(f.runs.last?["prompt"] as? String == english && f.runtime.currentMessages.first?.originalText == chinese,
+                  "Claude receives English while original Chinese remains separate in local history")
+            check(f.runtime.currentConversation?.title == chinese && completed == 1,
+                  "conversation keeps Chinese title and emits exactly one completed-turn event")
+            let message = f.runtime.currentMessages.first { $0.role == "assistant" }!
+            try f.runtime.saveTranslation(messageID: message.id, sourceText: message.text, text: "回复译文")
+            let reopened = try ChatStore(project: f.project, fileURL: f.store.fileURL)
+            let saved = reopened.conversations.flatMap(\.messages).first { $0.id == message.id }!
+            check(saved.text == message.text && saved.translatedText == "回复译文" && completed == 1,
+                  "cached reply translation does not change English source or trigger a quota refresh")
+            do { try f.runtime.saveTranslation(messageID: message.id, sourceText: "stale source", text: "错误译文"); check(false, "stale source rejected") }
+            catch { check(true, "stale translated reply cannot overwrite another source revision") }
+            f.send("A second turn in English.")
+            check(completed == 2 && f.runtime.currentMessages.first?.originalText == chinese,
+                  "each later turn emits one refresh while retaining prior Chinese source")
+            f.runtime.beforeStart = { _ in throw AppError.message("fixture preflight failure") }
+            check(!f.runtime.send(text: "must not run") && completed == 2,
+                  "a preflight failure does not trigger an online quota query")
+        }
+        do {
+            let legacy = try JSONDecoder().decode(ChatOptions.self, from: Data(#"{"model":"sonnet","permissionMode":"plan","effort":"high"}"#.utf8))
+            check(legacy.translateToEnglish == nil && legacy.autoTranslateReplies == nil && legacy.model == "sonnet",
+                  "pre-translation conversation options remain backward compatible")
+            let f = try Fixture(); defer { f.clean() }
+            var conversation = f.runtime.currentConversation!
+            conversation.messages = [ChatMessage(role: "user", text: "safe English", originalText: "Bearer fixture-original-token"),
+                                     ChatMessage(role: "assistant", text: "safe reply", translatedText: "Bearer fixture-translated-token")]
+            try f.store.save([conversation], selectedID: conversation.id)
+            let saved = try String(contentsOf: f.store.fileURL)
+            check(!saved.contains("fixture-original-token") && !saved.contains("fixture-translated-token"),
+                  "additional original and translated copies receive the same credential redaction as message text")
+        }
+        do {
+            let f = try Fixture("limit"); defer { f.clean() }
+            var completed = 0; f.runtime.onTurnFinished = { completed += 1 }
+            f.send("one turn across two accounts")
+            check(f.runs.count == 2 && completed == 1, "automatic account failover emits only one final-turn quota refresh")
+        }
         print("PASS: \(checks) chat checks (real CCAM, isolated fake Claude, no real credentials/API requests)")
     }
 }

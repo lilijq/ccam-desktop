@@ -27,14 +27,14 @@ struct QuotaSummary {
     let totalGauge: QuotaGaugeSnapshot
 
     static func make(accounts: [Account], usage: [AccountUsage], now: Date = Date(), preferredAccount: String? = nil) -> QuotaSummary {
-        let offline = "仅显示本机缓存，不连接 Claude。实际可用量可能已变化。"
+        let provenance = "显示最近读取的额度记录。每轮问答后经代理更新，不发送模型消息。实际可用量可能已变化。"
         // CCAM profile names are unique, but reject duplicate rows defensively.
         var seen = Set<String>()
         let accounts = accounts.filter { seen.insert($0.name).inserted }
         guard !accounts.isEmpty else {
             let empty = QuotaGaugeSnapshot(remainingFraction: nil, knownFraction: 0, stale: false,
-                                          tooltip: "暂无账号\n" + offline)
-            return QuotaSummary(title: "暂无账号", detail: "账号与额度", tooltip: offline,
+                                          tooltip: "暂无账号\n" + provenance)
+            return QuotaSummary(title: "暂无账号", detail: "账号与额度", tooltip: provenance,
                                 currentAccountName: nil, currentFiveHour: "--", currentWeekly: "--",
                                 totalFiveHour: "--", totalWeekly: "--", poolCoverage: "0 个账号", cacheLabel: "暂无缓存",
                                 currentGauge: empty, totalGauge: empty)
@@ -117,7 +117,7 @@ struct QuotaSummary {
         if accounts.contains(where: { normalizedEmail($0) == nil }) { lines.append("部分账号未提供邮箱，按独立账号计；身份去重尚未完全确认。") }
         if !oldReports.isEmpty { lines.append("合计包含 \(oldReports.count) 个账号的旧缓存；过期、读取失败或已过重置时间的数值不会自动补满。") }
         if knownReports.contains(where: \.needsLogin) { lines.append("合计包含需要重新登录的账号历史额度，不代表现在可执行。") }
-        lines.append(offline)
+        lines.append(provenance)
 
         func windowDescription(_ name: String, _ value: UsageWindow?) -> String {
             guard let value else { return name + "：未知" }
@@ -135,7 +135,7 @@ struct QuotaSummary {
             else if report.status == "error" || report.error?.isEmpty == false { currentLines.append("上次读取未成功，保留此前数值。") }
             if isOld(report, now: now), five != nil { currentLines.append("旧缓存不会因已过重置时间自动补满。") }
         } else { currentLines.append("此账号暂无额度缓存。") }
-        currentLines.append(offline)
+        currentLines.append(provenance)
         let currentGauge = QuotaGaugeSnapshot(remainingFraction: five.map { remaining($0.used) / 100 },
                                               knownFraction: five == nil ? 0 : 1,
                                               stale: five != nil && report.map { isOld($0, now: now) } == true,
@@ -163,7 +163,7 @@ struct QuotaSummary {
         if accounts.contains(where: { normalizedEmail($0) == nil }) { totalLines.append("部分账号未提供邮箱，身份去重尚未完全确认。") }
         if totalStale { totalLines.append("旧缓存不会因已过重置时间自动补满。") }
         if fiveReports.contains(where: \.needsLogin) { totalLines.append("包含需要重新登录的账号历史额度，不代表现在可执行。") }
-        totalLines.append(offline)
+        totalLines.append(provenance)
         let totalGauge = QuotaGaugeSnapshot(remainingFraction: remainingTotal,
                                             knownFraction: Double(fiveWindows.count) / Double(count), stale: totalStale,
                                             tooltip: totalLines.joined(separator: "\n"))

@@ -81,6 +81,7 @@ final class ProjectWorkspace: NSView {
     var onReturnFromTerminal: ((ProjectRecord, ChatTerminalTarget, @escaping (Result<ChatTerminalTarget, Error>) -> Void) -> Void)?
     var beforeChatStart: ((ProjectRecord, [String]) throws -> Void)?
     var onStateChange: (() -> Void)?
+    var onTurnFinished: (() -> Void)?
     var hasRunning: Bool { workspaces.values.contains { $0.chatView?.hasRunning == true } }
     var hasUnsavedChanges: Bool { workspaces.values.contains { $0.filesView?.hasUnsavedChanges == true } }
     var selectedSection: Section { current?.section ?? .terminal }
@@ -169,6 +170,7 @@ final class ProjectWorkspace: NSView {
             }
             workspace.chat.beforeStart = { [weak self] arguments in try self?.beforeChatStart?(project, arguments) }
             workspace.chat.onStateChange = { [weak self] in self?.onStateChange?() }
+            workspace.chat.onTurnFinished = { [weak self] in self?.onTurnFinished?() }
             if let section { workspace.section = section }
         } else { current = nil }
         if changedProject {

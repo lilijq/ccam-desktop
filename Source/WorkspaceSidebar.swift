@@ -170,7 +170,7 @@ final class SidebarQuotaGaugeButton: NSButton {
     }
     func update(_ value: QuotaGaugeSnapshot, readFailed: Bool) {
         snapshot = value; self.readFailed = readFailed
-        let prefix = readFailed ? "本机读取失败，保留旧缓存。\n" : ""
+        let prefix = readFailed ? "额度读取失败，保留旧记录。\n" : ""
         toolTip = prefix + value.tooltip + "\n点击进入账号与额度"
         setAccessibilityLabel((scope == .current ? "当前账号额度" : "账号池总额度") + "，剩余 " + displayedPercentage + "。" + prefix + value.tooltip)
     }

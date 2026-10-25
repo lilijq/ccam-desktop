@@ -46,6 +46,14 @@ swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" Source/NetworkEnv
 .build-cache/chat-tests
 swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" Source/ProjectStore.swift Source/ChatAttachments.swift Tests/ChatAttachmentTests.swift -o .build-cache/attachment-tests
 .build-cache/attachment-tests
+swiftc -swift-version 5 -module-cache-path "$PWD/.build-cache" Source/LocalTranslation.swift Tests/TranslationTests.swift -o .build-cache/translation-tests
+.build-cache/translation-tests
+CCAM_TRANSLATION_TEST_PYTHON=/usr/bin/python3
+if [[ -n "${CCAM_TRANSLATION_TEST_HOME:-}" ]]; then
+  CCAM_TRANSLATION_TEST_PYTHON="$CCAM_TRANSLATION_TEST_HOME/venv/bin/python3"
+fi
+"$CCAM_TRANSLATION_TEST_PYTHON" -I -B Tests/TranslationWorkerTests.py
+"$CCAM_TRANSLATION_TEST_PYTHON" -I -B Tests/TranslationExamplesTests.py
 /bin/zsh Tests/chat_ui_tests.sh
 if [[ -f 'CCAM Desktop.app.zip' ]]; then
   CCAM_VERIFY_DIR="$(mktemp -d /private/tmp/ccam-verify.XXXXXX)"

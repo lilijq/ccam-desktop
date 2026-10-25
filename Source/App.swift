@@ -1,5 +1,34 @@
 import AppKit
 
+/// Serialize inventory/usage reads so an older cache read cannot overwrite a
+/// turn-completion query. Bursts from simultaneous projects coalesce once.
+struct AccountQuotaRefreshQueue {
+    enum Source: Equatable {
+        case cache, live
+        var arguments: [String] {
+            switch self {
+            case .cache: return ["usage", "--json", "--source", "cache"]
+            case .live: return ["usage", "--json", "--source", "live", "--no-cache"]
+            }
+        }
+    }
+    private(set) var active: Source?
+    private var pending: Source?
+    mutating func begin(_ source: Source, repeatCache: Bool = false) -> Bool {
+        guard active == nil else {
+            if source == .live { pending = .live }
+            else if repeatCache && pending == nil { pending = .cache }
+            return false
+        }
+        active = source; return true
+    }
+    mutating func finish() -> Source? {
+        active = nil
+        defer { pending = nil }
+        return pending
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
     var isCompact = false
@@ -21,8 +50,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var usage: [AccountUsage] = []
     var accountsError: String?
     var usageError: String?
-    var refreshing = false
-    private var refreshAgain = false
+    private var quotaRefreshQueue = AccountQuotaRefreshQueue()
+    var refreshing: Bool { quotaRefreshQueue.active != nil }
     var lastRefresh: Date?
     var selected = 0
     var renderedPage = -1
@@ -173,7 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func updatePoolSummary() {
         let summary = QuotaSummary.make(accounts: accounts, usage: usage, preferredAccount: projectWorkspace.selectedAccountName)
         if refreshing && accounts.isEmpty { poolSummary.stringValue = "正在读取账号" }
-        else if accountsError != nil || usageError != nil { poolSummary.stringValue = "本地缓存读取失败" }
+        else if accountsError != nil || usageError != nil { poolSummary.stringValue = "额度更新失败，保留已有记录" }
         else if accounts.isEmpty { poolSummary.stringValue = "添加账号后开始任务" }
         else { poolSummary.stringValue = summary.detail }
         workspaceSidebar?.updateQuota(summary, readFailed: accountsError != nil || usageError != nil)
@@ -229,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false; scroll.translatesAutoresizingMaskIntoConstraints = false; main.addSubview(scroll); contentScroll = scroll
         projectWorkspace.translatesAutoresizingMaskIntoConstraints = false; projectWorkspace.isHidden = true; main.addSubview(projectWorkspace)
         projectWorkspace.onStateChange = { [weak self] in self?.updateSidebar() }
+        projectWorkspace.onTurnFinished = { [weak self] in self?.refresh(liveUsage: true) }
         projectWorkspace.onInteractiveTask = { [weak self] record, target in
             guard let self else { return }
             let plan = try GlobalPool.prepareChatTerminal(target: target)
@@ -322,8 +352,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         popover.contentSize = NSSize(width: 256, height: 330)
         popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .maxY)
     }
-    func refresh(forceUsage: Bool = false) {
-        guard !refreshing else { refreshAgain = refreshAgain || forceUsage; return }; refreshing = true; updatePoolSummary()
+    func refresh(forceUsage: Bool = false, liveUsage: Bool = false) {
+        let source: AccountQuotaRefreshQueue.Source = liveUsage ? .live : .cache
+        guard quotaRefreshQueue.begin(source, repeatCache: forceUsage) else { return }
+        updatePoolSummary()
         let group = DispatchGroup()
         group.enter(); CCAMClient.read(["list", "--json"], directory: FileManager.default.homeDirectoryForCurrentUser.path) { [weak self] result in
             defer { group.leave() }; guard let self else { return }
@@ -333,22 +365,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.terminalWorkspace.accountNames = self.accounts.map { $0.name }
             } catch { self.accountsError = error.localizedDescription }
         }
-        // Keep startup, activation, timers, login completion and manual refresh
-        // offline. The user can view stored limits without probing Claude.
-        group.enter(); CCAMClient.read(["usage", "--json", "--source", "cache"], directory: FileManager.default.homeDirectoryForCurrentUser.path) { [weak self] result in
+        // Startup, activation, timers and manual refresh only read local cache.
+        // A completed chat turn explicitly queries the usage endpoint through
+        // ExecutionProxy. Never use the model-backed `claude` source or refresh tokens.
+        group.enter(); CCAMClient.read(source.arguments, directory: FileManager.default.homeDirectoryForCurrentUser.path) { [weak self] result in
             defer { group.leave() }; guard let self else { return }
             do {
                 guard result.succeeded else { throw AppError.message(result.output) }
-                self.usage = try AccountUsage.parse(Data(result.output.utf8)); self.usageError = nil
-            } catch { self.usageError = error.localizedDescription }
+                let fresh = try AccountUsage.parse(Data(result.output.utf8))
+                self.usage = Self.mergeUsage(fresh, previous: self.usage)
+                let failures = fresh.filter { $0.status == "error" || $0.error?.isEmpty == false }
+                self.usageError = failures.isEmpty ? nil : "\(failures.count) 个账号额度未更新，保留已有记录。"
+            } catch {
+                self.usageError = (liveUsage ? "问答后的额度刷新失败，保留已有记录。\n" : "") + error.localizedDescription
+            }
         }
         group.notify(queue: .main) { [weak self] in
-            guard let self else { return }; self.refreshing = false; self.lastRefresh = Date()
+            guard let self else { return }
+            let next = self.quotaRefreshQueue.finish(); self.lastRefresh = Date()
             self.updatePoolSummary()
             if self.selected == 0 || self.selected == 1 { self.render() }
-            if self.refreshAgain { self.refreshAgain = false; self.refresh(forceUsage: true) }
+            if let next { self.refresh(forceUsage: true, liveUsage: next == .live) }
         }
         if selected == 0 || selected == 1 { render() }
+    }
+
+    /// A failed account row can carry no limits. Retain that account's prior
+    /// numbers and timestamp while preserving its new error/login status.
+    static func mergeUsage(_ fresh: [AccountUsage], previous: [AccountUsage]) -> [AccountUsage] {
+        fresh.map { report in
+            let old = previous.last(where: { $0.name == report.name })
+            if let old, report.status != "error", report.error?.isEmpty != false, !report.needsLogin,
+               let updatedAt = report.measuredAt.flatMap(usageDate), let oldAt = old.measuredAt.flatMap(usageDate),
+               updatedAt < oldAt, oldAt <= Date() { return old }
+            guard report.windows.isEmpty,
+                  report.status == "error" || report.error?.isEmpty == false || report.needsLogin,
+                  let old, !old.windows.isEmpty else { return report }
+            var raw = report.raw
+            raw["at"] = old.raw["at"]
+            raw["limits"] = old.raw["limits"]
+            raw["source"] = "cache"
+            return AccountUsage(name: report.name, status: report.status, error: report.error, windows: old.windows, raw: raw)
+        }
+    }
+    private static func usageDate(_ raw: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        if let date = formatter.date(from: raw) { return date }
+        formatter.formatOptions.insert(.withFractionalSeconds)
+        return formatter.date(from: raw)
     }
     func render() {
         updatePoolSummary()
@@ -392,12 +456,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !subtitle.isEmpty { fillWidth(label(subtitle, size: 12, color: Theme.muted), in: content) }
     }
     func dashboard() {
-        let reload = ClosureButton(refreshing ? "读取中…" : "刷新缓存", symbol: "arrow.clockwise") { [weak self] in self?.refresh(forceUsage: true) }
-        reload.isEnabled = !refreshing
-        reload.toolTip = "仅重读本机额度缓存，不连接 Claude"
-        header("账号与额度", "", action: row([reload, ClosureButton("添加账号", symbol: "plus") { [weak self] in self?.addAccount() }]))
+        let reload = AccountRefreshControl(refreshing: refreshing, lastRefresh: lastRefresh, failed: accountsError != nil || usageError != nil, live: quotaRefreshQueue.active == .live) { [weak self] in
+            self?.refresh(forceUsage: true)
+        }
+        let actions = row([reload, ClosureButton("添加账号", symbol: "plus") { [weak self] in self?.addAccount() }])
+        actions.alignment = .top
+        fillWidth(adaptiveRow([label("账号与额度", size: isCompact ? 23 : 28, weight: .semibold), spacer(), actions], spacing: 12, breakpoint: 560), in: content)
         let known = usage.filter { !$0.windows.isEmpty && !$0.needsLogin && $0.error == nil }.count
-        fillWidth(adaptiveRow([label("\(known) 个账号有缓存 · 联网查询已暂停", size: 12, color: Theme.muted), spacer(), ClosureButton("Chrome 账号锁", symbol: "lock") { [weak self] in self?.showBrowserLocks() }]), in: content)
+        fillWidth(adaptiveRow([label("\(known) 个账号有额度记录 · 问答后自动更新", size: 12, color: Theme.muted), spacer(), ClosureButton("Chrome 账号锁", symbol: "lock") { [weak self] in self?.showBrowserLocks() }]), in: content)
         if let error = accountsError ?? usageError { fillWidth(Card(label("读取提示：" + OperationPresentation.clean(error), size: 12, color: Theme.warning)), in: content) }
         if accounts.isEmpty { fillWidth(Card(column([label(refreshing ? "正在读取账号…" : "还没有账号", size: 20), label("添加或导入账号", color: Theme.muted)])), in: content) }
         for account in accounts { fillWidth(accountCard(account), in: content) }
@@ -513,6 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         proxyStatus.lineBreakMode = .byTruncatingMiddle
         addSetting(column([row([label("网络代理", size: 14), spacer(), ClosureButton("设置…") { [weak self] in self?.configureProxy() }]), proxyStatus], spacing: 8))
         addSetting(row([label("Chrome 账号锁", size: 14), spacer(), ClosureButton("管理", symbol: "lock") { [weak self] in self?.showBrowserLocks() }]))
+        addSetting(row([label("本机翻译", size: 14), spacer(), ClosureButton(LocalTranslator.shared.isReady ? "已就绪…" : "安装…", symbol: "character.bubble") { [weak self] in TranslationSetup.show(from: self?.window) }]))
         let location = label(CCAMClient.executable, size: 11, color: Theme.muted)
         location.lineBreakMode = .byTruncatingMiddle
         addSetting(column([row([label("CCAM", size: 14), spacer(), ClosureButton("更换…") { [weak self] in

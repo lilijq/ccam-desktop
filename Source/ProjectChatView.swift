@@ -208,8 +208,9 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     var onShowTerminal: (() -> Void)? { didSet { updateControls() } }
     var onReturnFromTerminal: ((ChatTerminalTarget, @escaping (Result<ChatTerminalTarget, Error>) -> Void) -> Void)? { didSet { updateControls() } }
     var onStateChange: (() -> Void)?
+    var onTurnFinished: (() -> Void)?
     var beforeStart: (([String]) throws -> Void)?
-    var hasRunning: Bool { runtime?.hasRunning ?? false }
+    var hasRunning: Bool { (runtime?.hasRunning ?? false) || outgoingTranslationID != nil }
     var historyItems: [(id: String, title: String)] {
         (runtime?.activeConversations ?? []).map { conversation in
             let title = conversation.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -255,9 +256,28 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     private var runtime: ChatRuntime?
     private var startupError: String?
     private var displayedID: String?
+    private let translator: ChatTranslating
+    private var translationButton: ClosureButton!
+    private var retryTranslationButton: ClosureButton!
+    private var outgoingTranslationID: UUID?
+    private var outgoingTranslation: TranslationRequest?
+    private var translationStatus: String?
+    private var translationFailed = false
+    private struct TranslationRetryDraft {
+        let conversationID: String?
+        let text: String
+        let attachmentIDs: [String]
+        let options: ChatOptions
+    }
+    private var translationRetryDraft: TranslationRetryDraft?
+    private var replyRequests: [String: TranslationRequest] = [:]
+    private var replyRequestIDs: [String: UUID] = [:]
+    private var replyErrors: [String: String] = [:]
+    private var expandedTranslations: Set<String> = []
+    private var expandedSentTexts: Set<String> = []
 
-    init(project: ProjectRecord) {
-        self.project = project
+    init(project: ProjectRecord, translator: ChatTranslating = LocalTranslator.shared) {
+        self.project = project; self.translator = translator
         super.init(frame: .zero)
         buildInterface()
         registerForDraggedTypes([.fileURL, .png, .tiff])
@@ -265,12 +285,20 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             let controller = try ChatRuntime(project: project)
             runtime = controller
             controller.onChange = { [weak self] in self?.refresh() }
+            controller.onTurnFinished = { [weak self] in
+                self?.translateCompletedReplies()
+                self?.onTurnFinished?()
+            }
             controller.beforeStart = { [weak self] arguments in try self?.beforeStart?(arguments) }
             if controller.selectedID == nil { controller.createConversation() }
         } catch { startupError = OperationPresentation.clean(error.localizedDescription) }
         refresh()
     }
     required init?(coder: NSCoder) { fatalError() }
+    deinit {
+        outgoingTranslation?.cancel()
+        replyRequests.values.forEach { $0.cancel() }
+    }
 
     private func buildInterface() {
         history.hasVerticalScroller = true; history.hasHorizontalScroller = false
@@ -366,10 +394,17 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         attachButton.isBordered = false; attachButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
         attachButton.setAccessibilityLabel("添加图片或文件"); attachButton.toolTip = "添加图片或文件；也可以拖入文件或粘贴截图"
         let controls = row([attachButton, modelPicker, effortPicker, permissionPicker, spacer(), stopButton, sendButton], spacing: 3)
+        translationButton = ClosureButton("中→EN") { [weak self] in self?.showTranslationMenu() }
+        translationButton.font = Theme.font(size: 10, weight: .semibold)
+        translationButton.cornerRadius = 7
+        translationButton.widthAnchor.constraint(equalToConstant: 62).isActive = true
+        translationButton.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        editor.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let inputRow = row([editor, translationButton], spacing: 8); inputRow.alignment = .top
         let composerBody = column([], spacing: 0)
         attachmentHeight = attachments.heightAnchor.constraint(equalToConstant: 0); attachmentHeight.isActive = true
         attachments.isHidden = true
-        fillWidth(attachments, in: composerBody); fillWidth(editor, in: composerBody); fillWidth(controls, in: composerBody)
+        fillWidth(attachments, in: composerBody); fillWidth(inputRow, in: composerBody); fillWidth(controls, in: composerBody)
         composerBody.translatesAutoresizingMaskIntoConstraints = false; composer.addSubview(composerBody)
         composer.translatesAutoresizingMaskIntoConstraints = false; addSubview(composer)
         let composerWidth = composer.widthAnchor.constraint(equalTo: history.contentView.widthAnchor, constant: -32)
@@ -404,8 +439,14 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         returnButton.font = Theme.font(size: 12); returnButton.isHidden = true
         returnButton.setAccessibilityLabel("返回聊天")
         returnButton.toolTip = "结束该对话的终端任务，保留上下文并恢复聊天。"
+        retryTranslationButton = ClosureButton("重试翻译", symbol: "arrow.clockwise") { [weak self] in self?.send() }
+        retryTranslationButton.font = Theme.font(size: 12)
+        retryTranslationButton.setAccessibilityLabel("重试翻译")
+        retryTranslationButton.toolTip = "重新翻译输入框中的草稿，成功后发送。"
+        retryTranslationButton.isHidden = true
         status.maximumNumberOfLines = 1; status.lineBreakMode = .byTruncatingTail
-        stateLine = row([status, spacer(), returnButton, fallbackButton], spacing: 8)
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        stateLine = row([status, spacer(), retryTranslationButton, returnButton, fallbackButton], spacing: 8)
         stateLine.translatesAutoresizingMaskIntoConstraints = false; addSubview(stateLine)
         approvalArea.translatesAutoresizingMaskIntoConstraints = false; addSubview(approvalArea)
         collapsedApproval = approvalArea.heightAnchor.constraint(equalToConstant: 0); collapsedApproval.isActive = true
@@ -456,7 +497,27 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         }
     }
 
-    func stop() { runtime?.stop() }
+    func stop() {
+        if outgoingTranslationID != nil {
+            cancelOutgoingTranslation()
+            translationStatus = "已取消翻译，草稿已保留"; translationFailed = false
+            refresh(); focusInput()
+        } else { runtime?.stop() }
+    }
+
+    private func cancelOutgoingTranslation() {
+        translationRetryDraft = nil
+        outgoingTranslationID = nil
+        let request = outgoingTranslation; outgoingTranslation = nil
+        request?.cancel()
+    }
+
+    private func cancelReplyTranslations() {
+        replyRequestIDs.removeAll()
+        let requests = replyRequests; replyRequests.removeAll()
+        requests.values.forEach { $0.cancel() }
+    }
+
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         !hasRunning && runtime?.currentConversationTransferred != true && AttachmentPasteboard.recognizes(sender.draggingPasteboard) ? .copy : []
@@ -477,7 +538,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
 
     /// Local staging only; the runtime does not send a request until Send is pressed.
     func addAttachments(_ urls: [URL]) throws {
-        guard let runtime, !runtime.hasRunning, !runtime.currentConversationTransferred else { throw AppError.message("请等待本轮完成，再添加附件。") }
+        guard let runtime, !hasRunning, !runtime.currentConversationTransferred else { throw AppError.message("请等待本轮完成，再添加附件。") }
         let store = ChatAttachmentStore(project: project)
         let added = try store.stageFiles(urls, existing: runtime.currentAttachments)
         do { try runtime.setDraftAttachments(runtime.currentAttachments + added) }
@@ -486,7 +547,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     func addImageAttachment(data: Data, name: String = "截图.png") throws {
-        guard let runtime, !runtime.hasRunning, !runtime.currentConversationTransferred else { throw AppError.message("请等待本轮完成，再添加附件。") }
+        guard let runtime, !hasRunning, !runtime.currentConversationTransferred else { throw AppError.message("请等待本轮完成，再添加附件。") }
         let store = ChatAttachmentStore(project: project)
         let added = try store.stageImage(data: data, name: name, existing: runtime.currentAttachments)
         do { try runtime.setDraftAttachments(runtime.currentAttachments + [added]) }
@@ -555,6 +616,8 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let selectedID = runtime?.selectedID
         let changedConversation = displayedID != selectedID
         if changedConversation {
+            cancelOutgoingTranslation(); cancelReplyTranslations()
+            translationStatus = nil; translationFailed = false
             let unassignedDraft = displayedID == nil ? input.string : ""
             saveDraft(); displayedID = selectedID
             input.string = selectedID.flatMap { drafts[$0] } ?? unassignedDraft
@@ -566,7 +629,8 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         refreshApprovals()
         let visible = (runtime?.currentMessages ?? []).map { message in
             DisplayMessage(id: message.id, role: message.role, text: message.text,
-                           title: message.toolName.map(toolTitle), isError: message.role == "error", attachments: message.attachments ?? [])
+                           title: message.toolName.map(toolTitle), isError: message.role == "error", attachments: message.attachments ?? [],
+                           originalText: message.originalText, translatedText: message.translatedText)
         }
         displayMessages(visible, conversationID: selectedID ?? "", scrollToEnd: changedConversation)
         updateControls()
@@ -644,6 +708,14 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let active = hasRunning
         let needsInteraction = runtime?.needsTerminalInteraction ?? false
         let transferred = runtime?.currentConversationTransferred ?? false
+        if let retry = translationRetryDraft,
+           retry.conversationID != runtime?.selectedID || retry.text != input.string ||
+           retry.attachmentIDs != runtime?.currentAttachments.map(\.id) || retry.options != runtime?.currentOptions {
+            translationRetryDraft = nil
+        }
+        let canRetryTranslation = translationRetryDraft != nil && !active && !transferred && (runtime?.currentOptions.translateToEnglish ?? true)
+        retryTranslationButton.isHidden = !canRetryTranslation
+        retryTranslationButton.isEnabled = canRetryTranslation
         sendButton.isEnabled = runtime != nil && !active && !transferred && (!input.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || runtime?.currentAttachments.isEmpty == false)
         sendButton.isHidden = active
         stopButton.isHidden = !active
@@ -651,6 +723,9 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         modelPicker.isEnabled = permissionPicker.isEnabled
         effortPicker.isEnabled = permissionPicker.isEnabled
         attachButton.isEnabled = runtime != nil && !active && !transferred
+        translationButton.isEnabled = runtime != nil && !active && !transferred
+        stopButton.setAccessibilityLabel(outgoingTranslationID == nil ? "停止当前任务" : "取消翻译")
+        stopButton.toolTip = outgoingTranslationID == nil ? "停止当前任务" : "取消翻译，保留草稿"
         // A terminal handoff owns execution, not the user's draft. Keep typing
         // available while requiring an explicit, completed handback to Send.
         input.isEditable = runtime != nil
@@ -662,9 +737,9 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         returnButton.isHidden = !transferred || onReturnFromTerminal == nil
         returnButton.isEnabled = !active && returningConversationID == nil
         returnButton.title = returningConversationID == runtime?.selectedID ? "正在返回…" : "返回聊天"
-        status.stringValue = startupError ?? (transferred ? "终端中 · 可写草稿" : runtime?.stateText ?? "")
+        status.stringValue = startupError ?? translationStatus ?? (transferred ? "终端中 · 可写草稿" : runtime?.stateText ?? "")
         status.toolTip = status.stringValue
-        status.textColor = startupError != nil || needsInteraction ? Theme.warning : Theme.muted
+        status.textColor = startupError != nil || needsInteraction || translationFailed ? Theme.warning : Theme.muted
         let idleStates = ["可以开始新任务", "继续这段对话", "已完成，可以继续提问", "已停止，已保存这段对话"]
         let needsStatus = !status.stringValue.isEmpty && !idleStates.contains(status.stringValue)
         let showsState = active || needsInteraction || transferred || startupError != nil || needsStatus
@@ -679,7 +754,8 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
 
     func textDidChange(_ notification: Notification) {
         guard !rendering else { return }
-        saveDraft(); input.needsDisplay = true; updateControls()
+        cancelOutgoingTranslation(); translationStatus = nil; translationFailed = false
+        saveDraft(); input.needsDisplay = true; updateControls(); onStateChange?()
     }
 
     func selectConversation(id: String) {
@@ -700,7 +776,53 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             item.representedObject = model; item.tag = 99
             modelPicker.menu?.insertItem(item, at: 4); modelPicker.select(item)
         }
+        let enabled = settings.translateToEnglish ?? true
+        translationButton.isBordered = enabled
+        translationButton.state = enabled ? .on : .off
+        let automatic = settings.autoTranslateReplies ?? true
+        translationButton.title = enabled ? "中→EN" : "翻译"
+        translationButton.setAccessibilityLabel("翻译设置")
+        translationButton.toolTip = "中文转英文发送：" + (enabled ? "开" : "关") + "；自动显示中文：" + (automatic ? "开" : "关") + "。在本机翻译，保留原文。"
+        translationButton.needsDisplay = true
         modelPicker.needsDisplay = true; effortPicker.needsDisplay = true; permissionPicker.needsDisplay = true
+    }
+
+    func translationSettingsMenu() -> NSMenu {
+        let menu = NSMenu(); menu.autoenablesItems = false
+        let settings = runtime?.currentOptions ?? ChatOptions()
+        for (title, enabled, tag) in [("中文输入转英文发送", settings.translateToEnglish ?? true, 0),
+                                      ("回复自动显示中文", settings.autoTranslateReplies ?? true, 1)] {
+            let item = NSMenuItem(title: title, action: #selector(translationPreferenceChanged(_:)), keyEquivalent: "")
+            item.target = self; item.tag = tag; item.state = enabled ? .on : .off
+            item.isEnabled = runtime != nil && !hasRunning && runtime?.currentConversationTransferred != true
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let setup = NSMenuItem(title: "本机翻译组件…", action: #selector(showTranslationSetup), keyEquivalent: "")
+        setup.target = self; menu.addItem(setup)
+        return menu
+    }
+
+    @objc private func showTranslationSetup() { TranslationSetup.show(from: window) }
+
+    private func showTranslationMenu() {
+        guard !hasRunning else { return }
+        translationSettingsMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: translationButton.bounds.height + 4), in: translationButton)
+    }
+
+    @objc private func translationPreferenceChanged(_ item: NSMenuItem) {
+        guard let runtime, !hasRunning, !runtime.currentConversationTransferred else { return }
+        translationRetryDraft = nil
+        do {
+            if item.tag == 0 { try runtime.setTranslationEnabled(!(runtime.currentOptions.translateToEnglish ?? true)) }
+            else {
+                let enabled = !(runtime.currentOptions.autoTranslateReplies ?? true)
+                try runtime.setAutomaticReplyTranslation(enabled)
+                if enabled { translateLatestReplies() }
+            }
+            translationStatus = nil; translationFailed = false
+        } catch { translationStatus = OperationPresentation.clean(error.localizedDescription); translationFailed = true }
+        renderedSignature = ""; refresh()
     }
 
     private func saveOptions(model: String?) {
@@ -814,7 +936,11 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     private func markdown(_ conversation: ChatConversation) -> String {
         let roles = ["user": "你", "assistant": "Claude", "tool": "工具", "error": "提示"]
         return "# " + conversation.title + "\n\n" + conversation.messages.map { message in
-            "## " + (message.toolName ?? roles[message.role] ?? message.role) + "\n\n" + message.text + (message.attachments ?? []).map { "\n\n附件：" + $0.name + "（" + $0.formattedSize + "）" }.joined()
+            let body: String
+            if let original = message.originalText { body = original + "\n\n### 已发送英文\n\n" + message.text }
+            else if let translated = message.translatedText { body = translated + "\n\n### 英文原文\n\n" + message.text }
+            else { body = message.text }
+            return "## " + (message.toolName ?? roles[message.role] ?? message.role) + "\n\n" + body + (message.attachments ?? []).map { "\n\n附件：" + $0.name + "（" + $0.formattedSize + "）" }.joined()
         }.joined(separator: "\n\n") + "\n"
     }
 
@@ -833,20 +959,106 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     private func send() {
-        guard let runtime, !runtime.hasRunning, !runtime.currentConversationTransferred else { return }
+        guard let runtime, !hasRunning, !runtime.currentConversationTransferred else { return }
         let rawInput = input.string
         let text = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !runtime.currentAttachments.isEmpty else { return }
-        if runtime.send(text: text) {
+        translationStatus = nil; translationFailed = false; translationRetryDraft = nil
+        guard runtime.currentOptions.translateToEnglish ?? true else {
+            sendPrepared(text: text, originalText: nil, draft: rawInput); return
+        }
+        let source = text.isEmpty ? "Please review the attached files." : text
+        let needsTranslation = source.unicodeScalars.contains { (0x3400...0x9FFF).contains($0.value) || (0x20000...0x3134F).contains($0.value) }
+        guard needsTranslation else {
+            sendPrepared(text: englishPrompt(source), originalText: text.isEmpty ? "请查看附件。" : text, draft: rawInput); return
+        }
+        let requestID = UUID(), conversationID = runtime.selectedID
+        let attachmentIDs = runtime.currentAttachments.map(\.id)
+        let options = runtime.currentOptions
+        outgoingTranslationID = requestID; translationStatus = "正在翻译…"
+        updateControls(); onStateChange?()
+        let request = translator.translate(source, from: .chinese, to: .english) { [weak self] result in
+            guard let self, self.outgoingTranslationID == requestID else { return }
+            self.outgoingTranslationID = nil; self.outgoingTranslation = nil
+            guard let runtime = self.runtime, runtime.selectedID == conversationID, !runtime.hasRunning,
+                  !runtime.currentConversationTransferred, self.input.string == rawInput,
+                  runtime.currentAttachments.map(\.id) == attachmentIDs, runtime.currentOptions == options else {
+                self.translationStatus = "内容已更改，请重新发送"; self.translationFailed = false
+                self.refresh(); return
+            }
+            do {
+                let translated = try result.get().trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !translated.isEmpty else { throw AppError.message("翻译结果为空，请重试。") }
+                self.sendPrepared(text: self.englishPrompt(translated), originalText: text, draft: rawInput)
+            } catch {
+                self.translationStatus = "翻译未完成：" + OperationPresentation.clean(error.localizedDescription)
+                self.translationRetryDraft = TranslationRetryDraft(conversationID: conversationID, text: rawInput, attachmentIDs: attachmentIDs, options: options)
+                self.translationFailed = true; self.refresh(); self.focusInput()
+            }
+        }
+        // A test or cached translator may complete synchronously.
+        if outgoingTranslationID == requestID { outgoingTranslation = request }
+    }
+
+    private func englishPrompt(_ text: String) -> String {
+        let instruction = "Please respond in English."
+        return text.hasSuffix(instruction) ? text : text + "\n\n" + instruction
+    }
+
+    private func sendPrepared(text: String, originalText: String?, draft: String) {
+        guard let runtime else { return }
+        translationStatus = nil; translationFailed = false; translationRetryDraft = nil
+        if runtime.send(text: text, originalText: originalText) {
             input.string = ""; input.needsDisplay = true
             if let id = runtime.selectedID { drafts[id] = "" }
         } else {
-            // Preparing a first turn may briefly assign an ID before rolling
-            // back. Its onChange callbacks must not erase an unassigned draft.
-            input.string = rawInput; input.needsDisplay = true
-            if let id = runtime.selectedID { drafts[id] = rawInput }
+            input.string = draft; input.needsDisplay = true
+            if let id = runtime.selectedID { drafts[id] = draft }
         }
         refresh(); focusInput()
+    }
+
+    private func translateCompletedReplies() {
+        guard let runtime, runtime.currentOptions.autoTranslateReplies ?? true,
+              runtime.stateText.hasPrefix("已完成") || runtime.stateText.hasPrefix("本轮结束") else { return }
+        translateLatestReplies()
+    }
+
+    private func translateLatestReplies() {
+        guard let runtime, !runtime.hasRunning,
+              let lastUser = runtime.currentMessages.lastIndex(where: { $0.role == "user" }) else { return }
+        for message in runtime.currentMessages.suffix(from: lastUser + 1) where message.role == "assistant" && !message.text.isEmpty && message.translatedText == nil {
+            beginReplyTranslation(id: message.id, source: message.text, revealTranslation: false)
+        }
+    }
+
+    private func translateReply(id: String, source: String) {
+        guard let runtime, !runtime.hasRunning,
+              runtime.currentMessages.contains(where: { $0.id == id && $0.role == "assistant" && $0.text == source }) else { return }
+        if runtime.currentMessages.first(where: { $0.id == id })?.translatedText != nil {
+            if expandedTranslations.contains(id) { expandedTranslations.remove(id) } else { expandedTranslations.insert(id) }
+            renderedSignature = ""; refresh(); return
+        }
+        beginReplyTranslation(id: id, source: source, revealTranslation: !(runtime.currentOptions.autoTranslateReplies ?? true))
+    }
+
+    private func beginReplyTranslation(id: String, source: String, revealTranslation: Bool) {
+        guard let runtime, let conversationID = runtime.selectedID, replyRequestIDs[id] == nil else { return }
+        let token = UUID(); replyRequestIDs[id] = token; replyErrors[id] = nil
+        renderedSignature = ""; refresh()
+        let request = translator.translate(source, from: .english, to: .chinese) { [weak self] result in
+            guard let self, self.replyRequestIDs[id] == token else { return }
+            self.replyRequestIDs[id] = nil; self.replyRequests[id] = nil
+            guard self.runtime?.selectedID == conversationID else { return }
+            do {
+                let translated = try result.get().trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !translated.isEmpty else { throw AppError.message("翻译结果为空，请重试。") }
+                try self.runtime?.saveTranslation(messageID: id, sourceText: source, text: translated)
+                if revealTranslation { self.expandedTranslations.insert(id) }
+            } catch { self.replyErrors[id] = OperationPresentation.clean(error.localizedDescription) }
+            self.renderedSignature = ""; self.refresh()
+        }
+        if replyRequestIDs[id] == token { replyRequests[id] = request }
     }
 
     private func toolTitle(_ name: String) -> String {
@@ -865,7 +1077,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         }
     }
 
-    private func addMessage(id: String, role: String, text: String, title: String?, isError: Bool = false, attachments: [ChatAttachment] = []) {
+    private func addMessage(id: String, role: String, text: String, title: String?, isError: Bool = false, attachments: [ChatAttachment] = [], originalText: String? = nil, translatedText: String? = nil) {
         if role == "tool" {
             let expanded = expandedTools.contains(id)
             let name = title ?? "工具操作"
@@ -892,8 +1104,45 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             strip.show(attachments, store: ChatAttachmentStore(project: project), remove: nil, preview: { [weak self] item, sender in self?.previewAttachment(item, from: sender) })
             fillWidth(strip, in: body)
         }
-        let content = messageText(text, color: isError ? Theme.warning : (role == "notice" ? Theme.muted : Theme.text))
+        let showsChinese = role == "assistant" && (runtime?.currentOptions.autoTranslateReplies ?? true) && translatedText != nil
+        let shownText = role == "user" ? originalText ?? text : showsChinese ? translatedText! : text
+        let content = messageText(shownText, color: isError ? Theme.warning : (role == "notice" ? Theme.muted : Theme.text))
         fillWidth(content, in: body)
+        if role == "user", originalText != nil {
+            let expanded = expandedSentTexts.contains(id)
+            let sent = ClosureButton(expanded ? "收起英文" : "已用英文发送", symbol: "character.bubble") { [weak self] in
+                guard let self else { return }
+                if self.expandedSentTexts.contains(id) { self.expandedSentTexts.remove(id) } else { self.expandedSentTexts.insert(id) }
+                self.renderedSignature = ""; self.refresh()
+            }
+            sent.isBordered = false; sent.font = Theme.font(size: 11)
+            sent.setAccessibilityLabel(expanded ? "收起发送的英文" : "查看发送的英文")
+            body.addArrangedSubview(sent)
+            if expanded { fillWidth(messageText(text, color: Theme.muted), in: body) }
+        }
+        if role == "assistant", !isError, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let pending = replyRequestIDs[id] != nil
+            let expanded = expandedTranslations.contains(id)
+            let translate = ClosureButton(pending ? "翻译中…" : "", symbol: "character.bubble") { [weak self] in self?.translateReply(id: id, source: text) }
+            translate.isBordered = false; translate.font = Theme.font(size: 11)
+            translate.isEnabled = runtime?.hasRunning != true && !pending
+            translate.toolTip = showsChinese ? (expanded ? "收起英文原文" : "查看英文原文") : (expanded ? "收起中文翻译" : "在本机翻译为中文，保留英文原文")
+            translate.setAccessibilityLabel(pending ? "正在翻译回复" : showsChinese ? (expanded ? "收起英文原文" : "查看英文原文") : (expanded ? "收起中文翻译" : "翻译回复为中文"))
+            if !pending { translate.widthAnchor.constraint(equalToConstant: 30).isActive = true }
+            let footer = row([translate], spacing: 8)
+            if let error = replyErrors[id] {
+                let detail = label(error, size: 11, color: Theme.warning); detail.maximumNumberOfLines = 2; detail.toolTip = error
+                footer.addArrangedSubview(detail)
+            }
+            footer.addArrangedSubview(spacer()); fillWidth(footer, in: body)
+            if expanded, let translatedText {
+                let translation = column([label(showsChinese ? "英文原文" : "中文", size: 10, color: Theme.muted), messageText(showsChinese ? text : translatedText, color: Theme.text)], spacing: 6)
+                let pane = ThemeSurface(Theme.panel, radius: 8)
+                translation.translatesAutoresizingMaskIntoConstraints = false; pane.addSubview(translation)
+                NSLayoutConstraint.activate([translation.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 12), translation.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -12), translation.topAnchor.constraint(equalTo: pane.topAnchor, constant: 10), translation.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -10)])
+                fillWidth(pane, in: body)
+            }
+        }
         if role == "user" {
             let surface = ThemeSurface(Theme.panel, radius: 14)
             body.translatesAutoresizingMaskIntoConstraints = false; surface.addSubview(body)
@@ -924,11 +1173,18 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let title: String?
         let isError: Bool
         let attachments: [ChatAttachment]
+        let originalText: String?
+        let translatedText: String?
     }
 
     private func displayMessages(_ items: [DisplayMessage], conversationID: String, scrollToEnd: Bool = false) {
-        let signature = conversationID + items.map { $0.id + $0.role + $0.text + ($0.title ?? "") + String($0.isError) + $0.attachments.map(\.id).joined() }.joined(separator: "\u{1e}")
-            + expandedTools.sorted().joined(separator: "\u{1f}")
+        let messageSignatures = items.map { item in
+            [item.id, item.role, item.text, item.title ?? "", String(item.isError), item.attachments.map(\.id).joined(), item.originalText ?? "", item.translatedText ?? ""].joined(separator: "\u{1e}")
+        }
+        let signature = ([conversationID] + messageSignatures + [
+            expandedTools.sorted().joined(), expandedTranslations.sorted().joined(), expandedSentTexts.sorted().joined(),
+            replyRequestIDs.keys.sorted().joined(), String(runtime?.hasRunning ?? false), String(runtime?.currentOptions.autoTranslateReplies ?? true)
+        ]).joined(separator: "\u{1f}")
         guard signature != renderedSignature else { return }
         renderedSignature = signature
         let previousOffset = history.contentView.bounds.origin.y
@@ -936,7 +1192,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         for view in messages.arrangedSubviews { messages.removeArrangedSubview(view); view.removeFromSuperview() }
         for message in items {
             if message.role == "user", let previous = messages.arrangedSubviews.last { messages.setCustomSpacing(32, after: previous) }
-            addMessage(id: message.id, role: message.role, text: message.text, title: message.title, isError: message.isError, attachments: message.attachments)
+            addMessage(id: message.id, role: message.role, text: message.text, title: message.title, isError: message.isError, attachments: message.attachments, originalText: message.originalText, translatedText: message.translatedText)
         }
         renderRevision += 1
         let revision = renderRevision

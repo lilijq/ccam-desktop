@@ -22,7 +22,7 @@ import Foundation
 
         let none = QuotaSummary.make(accounts: [], usage: [report("removed", five: 0)], now: now)
         check(none.title == "暂无账号", "removed accounts cannot leak into the footer")
-        check(none.tooltip.contains("不连接 Claude"), "offline behavior is explicit")
+        check(none.tooltip.contains("不发送模型消息"), "quota refresh does not imply a model request")
         check(summary([]).title == "额度未知", "missing limits are unknown rather than zero")
         check(summary([report("first", status: "logged_out")]).title == "需要登录", "login-needed status remains distinct")
         check(summary([report("first", status: "api")]).title == "API 账号", "API account gets no fabricated percentage")
@@ -154,7 +154,7 @@ import Foundation
               "tiny positive gauge preserves exact magnitude rather than formatted text rounding")
         check(mixed.totalGauge.tooltip.contains("未按套餐加权") && close(mixed.totalGauge.remainingFraction, 0.5),
               "mixed-plan gauge remains explicitly unweighted")
-        check(regular.currentGauge.tooltip.contains("不连接 Claude") && regular.totalGauge.tooltip.contains("不连接 Claude"),
+        check(regular.currentGauge.tooltip.contains("不发送模型消息") && regular.totalGauge.tooltip.contains("不发送模型消息"),
               "both gauge tooltips retain offline cache provenance")
         print("PASS: \(count) cached quota summary checks (fixtures only, no CLI or network requests)")
     }

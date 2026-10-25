@@ -67,6 +67,8 @@ final class ChatRuntime {
     var onChange: (() -> Void)?
     var onMessage: ((ChatMessage) -> Void)?
     var onState: ((String) -> Void)?
+    var onTurnFinished: (() -> Void)?
+    private var completedTurnPending = false
     private var process: Process?
     private var inputHandle: FileHandle?
     private let inputQueue = DispatchQueue(label: "ccam.chat.stdin")
@@ -161,7 +163,9 @@ final class ChatRuntime {
         if let selectedID, let index = updated.firstIndex(where: { $0.id == selectedID && $0.deletedAt == nil }) {
             guard !updated[index].transferredToTerminal else { throw AppError.message("请在终端修改这段对话的设置。") }
             id = selectedID
-            updated[index].options = ChatOptions(model: validatedModel, permissionMode: permissionMode, effort: effort)
+            var options = updated[index].options ?? ChatOptions()
+            options.model = validatedModel; options.permissionMode = permissionMode; options.effort = effort
+            updated[index].options = options
             updated[index].updatedAt = Date()
         } else {
             let conversation = ChatConversation(id: UUID().uuidString, title: "新对话", projectID: project.id.uuidString, directory: project.path,
@@ -314,8 +318,44 @@ final class ChatRuntime {
         if selectedID == conversationID { state("已返回聊天，可以继续原任务") }
     }
 
+    func setTranslationEnabled(_ enabled: Bool) throws {
+        try updateTranslationOptions { $0.translateToEnglish = enabled }
+    }
+
+    func setAutomaticReplyTranslation(_ enabled: Bool) throws {
+        try updateTranslationOptions { $0.autoTranslateReplies = enabled }
+    }
+
+    private func updateTranslationOptions(_ change: (inout ChatOptions) -> Void) throws {
+        guard !hasRunning else { throw AppError.message("请等待本轮完成或先停止，再修改翻译设置。") }
+        var updated = conversations
+        let id = currentConversation?.id ?? UUID().uuidString
+        if !updated.contains(where: { $0.id == id }) {
+            updated.insert(ChatConversation(id: id, title: "新对话", projectID: project.id.uuidString, directory: project.path), at: 0)
+        }
+        let index = updated.firstIndex { $0.id == id }!
+        var options = updated[index].options ?? ChatOptions(); change(&options)
+        updated[index].options = options
+        try store.save(updated, selectedID: id)
+        conversations = updated; selectedID = id; changed()
+    }
+
+    func saveTranslation(messageID: String, sourceText: String, text: String) throws {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 1_048_576 else {
+            throw AppError.message("译文为空或过长，原文已保留。")
+        }
+        var updated = conversations
+        guard let conversationIndex = updated.firstIndex(where: { $0.deletedAt == nil && $0.messages.contains(where: { $0.id == messageID }) }),
+              let messageIndex = updated[conversationIndex].messages.firstIndex(where: { $0.id == messageID && $0.role == "assistant" && $0.text == sourceText }) else {
+            throw AppError.message("原文已改变，请重新翻译。")
+        }
+        updated[conversationIndex].messages[messageIndex].translatedText = text
+        try store.save(updated, selectedID: selectedID)
+        conversations = updated; changed()
+    }
+
     @discardableResult
-    func send(text: String, permissionMode: ChatPermissionMode? = nil) -> Bool {
+    func send(text: String, permissionMode: ChatPermissionMode? = nil, originalText: String? = nil) -> Bool {
         let attachments = currentAttachments
         guard !hasRunning, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else { return false }
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "请查看附件。" : text
@@ -338,8 +378,8 @@ final class ChatRuntime {
         if !updated.contains(where: { $0.id == conversation.id }) { updated.insert(conversation, at: 0) }
         let index = updated.firstIndex { $0.id == conversation.id }!
         updated[index].options = options
-        if updated[index].messages.isEmpty && updated[index].title == "新对话" { updated[index].title = String(text.split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(48) ?? "新对话".prefix(48)) }
-        updated[index].messages.append(ChatMessage(role: "user", text: text, attachments: attachments.isEmpty ? nil : attachments))
+        if updated[index].messages.isEmpty && updated[index].title == "新对话" { updated[index].title = String((originalText ?? text).split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(48) ?? "新对话".prefix(48)) }
+        updated[index].messages.append(ChatMessage(role: "user", text: text, attachments: attachments.isEmpty ? nil : attachments, originalText: originalText))
         updated[index].draftAttachments = nil; updated[index].updatedAt = Date()
         conversations = updated; selectedID = conversation.id
         runConversationID = conversation.id; runOptions = options; runAttachments = attachments; needsTerminalInteraction = false
@@ -379,7 +419,7 @@ final class ChatRuntime {
         }
         hasRunning = false
         if let plan { GlobalPool.clean(plan); self.plan = nil }
-        state("已停止，已保存这段对话"); persist()
+        state("已停止，已保存这段对话"); persist(); notifyTurnFinished()
     }
 
     func approve(id: String) throws {
@@ -565,6 +605,7 @@ final class ChatRuntime {
             // process can act on this prompt. Persistence failure cannot start it.
             try beforeSpawn?()
             try child.run(); process = child; inputHandle = input.fileHandleForWriting
+            completedTurnPending = true
             state(automatic ? "已切换账号，正在接续未完成任务" : "正在连接会话")
             poll = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.readHooks(expected) }
             let initialize = "ccam-init-" + UUID().uuidString
@@ -599,7 +640,7 @@ final class ChatRuntime {
         } catch {
             clearControlState()
             if let plan { GlobalPool.clean(plan); self.plan = nil }
-            hasRunning = false; state("未能开始：" + error.localizedDescription)
+            hasRunning = false; state("未能开始：" + error.localizedDescription); notifyTurnFinished()
             if automatic { append(role: "error", text: error.localizedDescription); persist() }
             return false
         }
@@ -741,7 +782,7 @@ final class ChatRuntime {
         let message = ChatMessage(role: "tool", text: "正在使用 \(name)", toolName: name); toolIDs[key] = message.id; append(message)
     }
     private func finished(_ code: Int32, _ expected: Int) {
-        defer { if !hasRunning { initialInput = nil; runAttachments = [] } }
+        defer { if !hasRunning { initialInput = nil; runAttachments = []; notifyTurnFinished() } }
         if stoppingGeneration == expected {
             clearControlState()
             captureIdentity()
@@ -791,6 +832,12 @@ final class ChatRuntime {
             append(role: "notice", text: "未收到可验证的会话身份记录，下一轮不会猜测账号或最近会话。")
         }
         persist(); changed()
+    }
+
+    private func notifyTurnFinished() {
+        guard !hasRunning, completedTurnPending else { return }
+        completedTurnPending = false
+        onTurnFinished?()
     }
 
     private func terminate(_ child: Process) {

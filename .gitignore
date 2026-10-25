@@ -4,6 +4,8 @@
 *.app.zip
 *.zip
 *.dSYM/
+__pycache__/
+*.py[cod]
 
 # Machine-specific artifacts and working notes
 /桌面验收/

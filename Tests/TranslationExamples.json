@@ -1,0 +1,253 @@
+[
+  {
+    "id": "negative_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "请检查这个项目，不要修改任何文件。",
+    "literals": [],
+    "title": "中文禁止修改",
+    "negation_regex": "(?i)\\b(?:not|without|no)\\b"
+  },
+  {
+    "id": "negative_en",
+    "source": "en",
+    "target": "zh",
+    "input": "Inspect this project. Do not modify any files.",
+    "literals": [],
+    "title": "英文禁止修改",
+    "negation_regex": "不|勿|无|未|别"
+  },
+  {
+    "id": "rust_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "请解释这段代码，不要修改它。\n```rust\nfn main() { println!(\"你好\"); }\n```\n",
+    "literals": [
+      "```rust\nfn main() { println!(\"你好\"); }\n```\n"
+    ],
+    "title": "Rust 代码块",
+    "negation_regex": "(?i)\\b(?:not|without|no)\\b"
+  },
+  {
+    "id": "swift_en",
+    "source": "en",
+    "target": "zh",
+    "input": "This function returns a greeting.\n```swift\nfunc greet() -> String { \"hello\" }\n```\n",
+    "literals": [
+      "```swift\nfunc greet() -> String { \"hello\" }\n```\n"
+    ],
+    "title": "Swift 代码块"
+  },
+  {
+    "id": "python_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "解释下面的函数，并给出测试建议。\n```python\ndef add(a, b):\n    return a + b\n```\n",
+    "literals": [
+      "```python\ndef add(a, b):\n    return a + b\n```\n"
+    ],
+    "title": "Python 代码块"
+  },
+  {
+    "id": "inline_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "请检查 `src/main.rs` 的错误，运行 `cargo test`，不要改动配置文件。",
+    "literals": [
+      "`src/main.rs`",
+      "`cargo test`"
+    ],
+    "title": "中文多段行内代码",
+    "negation_regex": "(?i)\\b(?:not|without|no)\\b"
+  },
+  {
+    "id": "inline_en",
+    "source": "en",
+    "target": "zh",
+    "input": "Call `getStatus()` with `user_id` and inspect `result.value`.",
+    "literals": [
+      "`getStatus()`",
+      "`user_id`",
+      "`result.value`"
+    ],
+    "title": "英文多个标识符"
+  },
+  {
+    "id": "url_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "请参考 https://example.test/docs?q=rust&lang=en#usage 并说明步骤。",
+    "literals": [
+      "https://example.test/docs?q=rust&lang=en#usage"
+    ],
+    "title": "中文带查询参数 URL"
+  },
+  {
+    "id": "url_en",
+    "source": "en",
+    "target": "zh",
+    "input": "See https://example.test/docs?q=rust&lang=en#usage for the steps.",
+    "literals": [
+      "https://example.test/docs?q=rust&lang=en#usage"
+    ],
+    "title": "英文带查询参数 URL"
+  },
+  {
+    "id": "windows_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "读取 C:\\work\\app\\main.rs 并说明错误。",
+    "literals": [
+      "C:\\work\\app\\main.rs"
+    ],
+    "title": "Windows 路径"
+  },
+  {
+    "id": "unix_en",
+    "source": "en",
+    "target": "zh",
+    "input": "Read /tmp/demo.json and ~/app/src/main.rs without changing either file.",
+    "literals": [
+      "/tmp/demo.json",
+      "~/app/src/main.rs"
+    ],
+    "title": "Unix 与用户目录路径",
+    "negation_regex": "不|勿|无|未|别"
+  },
+  {
+    "id": "shell_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "运行 `git diff --stat -- src/main.rs`，只查看变化。",
+    "literals": [
+      "`git diff --stat -- src/main.rs`"
+    ],
+    "title": "Git 命令与参数"
+  },
+  {
+    "id": "shell_en",
+    "source": "en",
+    "target": "zh",
+    "input": "Run git status --short before making changes.",
+    "literals": [
+      "git status",
+      "--short"
+    ],
+    "title": "未加反引号的命令"
+  },
+  {
+    "id": "heading_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "# 检查步骤\n\n- 读取文件。\n- 运行测试。\n\n## 注意事项\n不要提交改动。",
+    "literals": [],
+    "title": "中文标题与列表",
+    "negation_regex": "(?i)\\b(?:not|without|no)\\b",
+    "markdown_prefixes": true
+  },
+  {
+    "id": "heading_en",
+    "source": "en",
+    "target": "zh",
+    "input": "# Review steps\n\n1. Read the files.\n2. Run the tests.\n\n## Notes\nDo not commit changes.",
+    "literals": [],
+    "title": "英文标题与编号列表",
+    "negation_regex": "不|勿|无|未|别",
+    "markdown_prefixes": true
+  },
+  {
+    "id": "table_en",
+    "source": "en",
+    "target": "zh",
+    "input": "| File | Status |\n| --- | --- |\n| `src/main.rs` | Ready for review |\n",
+    "literals": [
+      "`src/main.rs`"
+    ],
+    "title": "Markdown 表格",
+    "table": true
+  },
+  {
+    "id": "json_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "说明这个配置。\n```json\n{\"name\":\"demo\",\"enabled\":true}\n```\n",
+    "literals": [
+      "```json\n{\"name\":\"demo\",\"enabled\":true}\n```\n"
+    ],
+    "title": "JSON 配置代码块"
+  },
+  {
+    "id": "yaml_en",
+    "source": "en",
+    "target": "zh",
+    "input": "Keep this configuration unchanged.\n```yaml\nservice:\n  port: 7897\n  enabled: true\n```\n",
+    "literals": [
+      "```yaml\nservice:\n  port: 7897\n  enabled: true\n```\n"
+    ],
+    "title": "YAML 配置代码块"
+  },
+  {
+    "id": "mixed_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "请检查 Rust 项目的 API 返回值，并保留 user_id 和 getStatus。",
+    "literals": [
+      "user_id",
+      "getStatus"
+    ],
+    "title": "中英混合技术说明"
+  },
+  {
+    "id": "long_en",
+    "source": "en",
+    "target": "zh",
+    "input": "The application reads account status from a local cache. After a completed conversation, it refreshes quota information through the configured proxy. Translation runs locally and does not send the source text to a public translation service. Keep the original response available so the user can compare it with the translated version.",
+    "literals": [],
+    "title": "长段落说明",
+    "negation_regex": "不|勿|无|未|别"
+  },
+  {
+    "id": "codeonly",
+    "source": "en",
+    "target": "zh",
+    "input": "```python\nprint(\"你好\")\n```\n",
+    "literals": [
+      "```python\nprint(\"你好\")\n```\n"
+    ],
+    "title": "纯代码无需翻译",
+    "unchanged": true
+  },
+  {
+    "id": "punctuation",
+    "source": "zh",
+    "target": "en",
+    "input": "！？。……",
+    "literals": [],
+    "title": "纯标点无需翻译",
+    "unchanged": true
+  },
+  {
+    "id": "collisions_zh",
+    "source": "zh",
+    "target": "en",
+    "input": "说明 CCAM0 和 ZXQ1 的用途，保留 `getStatus`。",
+    "literals": [
+      "CCAM0",
+      "ZXQ1",
+      "`getStatus`"
+    ],
+    "title": "中文原文占位符同名标识符"
+  },
+  {
+    "id": "collisions_en",
+    "source": "en",
+    "target": "zh",
+    "input": "Compare CCAM0 with ZXQ1 and keep `user_id` unchanged.",
+    "literals": [
+      "CCAM0",
+      "ZXQ1",
+      "`user_id`"
+    ],
+    "title": "英文原文占位符同名标识符"
+  }
+]
