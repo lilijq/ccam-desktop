@@ -1,11 +1,82 @@
 import AppKit
+import UniformTypeIdentifiers
+import Quartz
 
 private final class ChatDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// Keep native menu, keyboard and accessibility behavior while making the
+/// selected model and mode read as one quiet line of conversation controls.
+private final class ComposerMenuButton: NSPopUpButton {
+    var showsMode = false
+    private var hovering = false
+    private var tracking: NSTrackingArea?
+
+    override init(frame buttonFrame: NSRect, pullsDown flag: Bool) {
+        super.init(frame: buttonFrame, pullsDown: flag)
+        isBordered = false; focusRingType = .exterior
+        font = Theme.font(size: 12, weight: .medium)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        tracking = NSTrackingArea(rect: .zero, options: [.inVisibleRect, .mouseEnteredAndExited, .activeInKeyWindow], owner: self)
+        addTrackingArea(tracking!)
+    }
+    override func mouseEntered(with event: NSEvent) { hovering = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+    override var focusRingMaskBounds: NSRect { bounds.insetBy(dx: 1, dy: 1) }
+    override func drawFocusRingMask() { NSBezierPath(roundedRect: focusRingMaskBounds, xRadius: 7, yRadius: 7).fill() }
+    override func draw(_ dirtyRect: NSRect) {
+        let mode = selectedItem?.representedObject as? String ?? "default"
+        let activeMode = showsMode && mode != "default"
+        if hovering || isHighlighted || activeMode {
+            (hovering || isHighlighted ? Theme.border : Theme.button).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7).fill()
+        }
+        let color = isEnabled ? Theme.text : Theme.muted
+        var x: CGFloat = 8
+        var text = titleOfSelectedItem ?? ""
+        if showsMode {
+            text = ["default": "默认", "plan": "计划", "auto": "Auto", "acceptEdits": "编辑"][mode] ?? text
+            let symbol = ["default": "hand.raised", "plan": "list.bullet.clipboard", "auto": "sparkle", "acceptEdits": "pencil"][mode] ?? "hand.raised"
+            if let icon = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(.init(paletteColors: [color])) {
+                let scale = min(13 / max(1, icon.size.width), 13 / max(1, icon.size.height))
+                let size = NSSize(width: icon.size.width * scale, height: icon.size.height * scale)
+                icon.draw(in: NSRect(x: x + (13-size.width)/2, y: (bounds.height-size.height)/2, width: size.width, height: size.height))
+            }
+            x += 18
+        }
+        let paragraph = NSMutableParagraphStyle(); paragraph.lineBreakMode = .byTruncatingTail
+        let value = NSAttributedString(string: text, attributes: [.font: font ?? Theme.font(size: 12), .foregroundColor: color, .paragraphStyle: paragraph])
+        value.draw(in: NSRect(x: x, y: (bounds.height-value.size().height)/2, width: max(0, bounds.width-x-20), height: value.size().height))
+        let arrow = NSBezierPath(); arrow.lineWidth = 1.25; arrow.lineCapStyle = .round; arrow.lineJoinStyle = .round
+        let direction: CGFloat = isFlipped ? 1 : -1
+        arrow.move(to: NSPoint(x: bounds.width-14, y: bounds.midY-direction*1.5))
+        arrow.line(to: NSPoint(x: bounds.width-11, y: bounds.midY+direction*1.5))
+        arrow.line(to: NSPoint(x: bounds.width-8, y: bounds.midY-direction*1.5))
+        Theme.muted.setStroke(); arrow.stroke()
+    }
+}
+
 private final class ChatInputView: NSTextView {
     var onSubmit: (() -> Void)?
+    var onAttachment: ((NSPasteboard) -> Bool)?
+    override func paste(_ sender: Any?) {
+        if isEditable, onAttachment?(NSPasteboard.general) == true { return }
+        super.paste(sender)
+    }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if isEditable, AttachmentPasteboard.recognizes(sender.draggingPasteboard) { return .copy }
+        return super.draggingEntered(sender)
+    }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        if isEditable, onAttachment?(sender.draggingPasteboard) == true { return true }
+        return super.performDragOperation(sender)
+    }
     override func keyDown(with event: NSEvent) {
         if event.modifierFlags.contains(.command), event.keyCode == 36 || event.keyCode == 76 {
             onSubmit?()
@@ -31,14 +102,16 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     var beforeStart: (([String]) throws -> Void)?
     var hasRunning: Bool { runtime?.hasRunning ?? false }
     var historyItems: [(id: String, title: String)] {
-        (runtime?.conversations ?? []).map { conversation in
+        (runtime?.activeConversations ?? []).map { conversation in
             let title = conversation.title.trimmingCharacters(in: .whitespacesAndNewlines)
             return (conversation.id, title.isEmpty ? "新对话" : title)
         }
     }
     var selectedConversationID: String? { runtime?.selectedID }
+    var selectedAccountName: String? { runtime?.currentConversation?.account }
 
-    private let permissionPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let permissionPicker = ComposerMenuButton(frame: .zero, pullsDown: false)
+    private let modelPicker = ComposerMenuButton(frame: .zero, pullsDown: false)
     private let status = label("", size: 12, color: Theme.muted)
     private let history = ThemeScrollView()
     private let document = ChatDocumentView()
@@ -51,8 +124,13 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     private var sendButton: ClosureButton!
     private var stopButton: ClosureButton!
     private var fallbackButton: ClosureButton!
+    private var optionsButton: ClosureButton!
+    private var attachButton: ClosureButton!
+    private let attachments = AttachmentStrip()
+    private var attachmentHeight: NSLayoutConstraint!
+    private var attachmentSignature = ""
+    private var previewPopover: NSPopover?
     private var drafts: [String: String] = [:]
-    private var modes: [String: String] = [:]
     private var expandedTools: Set<String> = []
     private var renderedSignature = ""
     private var rendering = false
@@ -65,6 +143,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         self.project = project
         super.init(frame: .zero)
         buildInterface()
+        registerForDraggedTypes([.fileURL, .png, .tiff])
         do {
             let controller = try ChatRuntime(project: project)
             runtime = controller
@@ -119,23 +198,33 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
 
         input.isRichText = false; input.font = Theme.font(size: 15)
         input.textColor = Theme.text; input.drawsBackground = false; input.insertionPointColor = Theme.text
-        input.textContainerInset = NSSize(width: 1, height: 10)
+        input.textContainerInset = NSSize(width: 3, height: 10)
         input.isVerticallyResizable = true; input.isHorizontallyResizable = false
         input.autoresizingMask = [.width]; input.textContainer?.widthTracksTextView = true
         input.isAutomaticQuoteSubstitutionEnabled = false; input.isAutomaticDashSubstitutionEnabled = false
         input.isAutomaticSpellingCorrectionEnabled = false; input.delegate = self
         input.setAccessibilityLabel("对话输入"); input.onSubmit = { [weak self] in self?.send() }
+        input.registerForDraggedTypes([.fileURL, .png, .tiff, .string])
+        input.onAttachment = { [weak self] board in self?.receiveAttachments(board) ?? false }
         let editor = ThemeScrollView(); editor.documentView = input
         editor.hasVerticalScroller = true; editor.hasHorizontalScroller = false
         editor.drawsBackground = false; editor.borderType = .noBorder
-        editor.heightAnchor.constraint(equalToConstant: 66).isActive = true
+        editor.heightAnchor.constraint(equalToConstant: 68).isActive = true
 
-        permissionPicker.addItems(withTitles: ["询问权限", "允许编辑", "只做计划"])
-        for (item, value) in zip(permissionPicker.itemArray, ["default", "acceptEdits", "plan"]) { item.representedObject = value }
-        permissionPicker.font = Theme.font(size: 12)
-        permissionPicker.isBordered = false
-        permissionPicker.setAccessibilityLabel("本轮权限模式")
-        permissionPicker.toolTip = "询问权限：保留标准权限检查。允许编辑：允许修改项目文件。只做计划：分析和规划。"
+        modelPicker.addItems(withTitles: ["默认模型", "Sonnet", "Opus", "Haiku", "自定义…"])
+        for (item, value) in zip(modelPicker.itemArray, ["", "sonnet", "opus", "haiku", "__custom__"]) { item.representedObject = value }
+        modelPicker.setAccessibilityLabel("选择模型")
+        modelPicker.toolTip = "选择本次对话的模型；切换后保留上下文，发送时生效。"
+        modelPicker.target = self; modelPicker.action = #selector(modelChanged)
+        permissionPicker.addItems(withTitles: ["默认模式", "计划模式", "Auto 模式", "允许编辑"])
+        for (item, value) in zip(permissionPicker.itemArray, ["default", "plan", "auto", "acceptEdits"]) { item.representedObject = value }
+        permissionPicker.showsMode = true
+        for picker in [modelPicker, permissionPicker] {
+            picker.widthAnchor.constraint(equalToConstant: picker === modelPicker ? 90 : 80).isActive = true
+            picker.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        }
+        permissionPicker.setAccessibilityLabel("选择权限模式")
+        permissionPicker.toolTip = "默认：需要权限时转到终端确认。计划：先分析和规划，修改前确认。Auto：自动评估操作权限，可用性由模型和服务决定。允许编辑：自动允许文件编辑。"
         permissionPicker.target = self; permissionPicker.action = #selector(permissionChanged)
         sendButton = ClosureButton("", symbol: "arrow.up") { [weak self] in self?.send() }
         sendButton.imagePosition = .imageOnly; sendButton.bezelColor = Theme.primary
@@ -151,18 +240,27 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             button.heightAnchor.constraint(equalToConstant: 34).isActive = true
         }
         stopButton.isHidden = true
-        let controls = row([permissionPicker, spacer(), stopButton, sendButton], spacing: 6)
+        optionsButton = ClosureButton("", symbol: "ellipsis") {}
+        optionsButton.isBordered = false; optionsButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        optionsButton.setAccessibilityLabel("对话设置与操作"); optionsButton.toolTip = "对话设置与操作"
+        optionsButton.actionBlock = { [weak self] in guard let self else { return }; self.showCurrentActions(from: self.optionsButton) }
+        attachButton = ClosureButton("", symbol: "paperclip") { [weak self] in self?.chooseAttachments() }
+        attachButton.isBordered = false; attachButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        attachButton.setAccessibilityLabel("添加图片或文件"); attachButton.toolTip = "添加图片或文件；也可以拖入文件或粘贴截图"
+        let controls = row([attachButton, modelPicker, permissionPicker, spacer(), optionsButton, stopButton, sendButton], spacing: 4)
         let composerBody = column([], spacing: 0)
-        fillWidth(editor, in: composerBody); fillWidth(controls, in: composerBody)
+        attachmentHeight = attachments.heightAnchor.constraint(equalToConstant: 0); attachmentHeight.isActive = true
+        attachments.isHidden = true
+        fillWidth(attachments, in: composerBody); fillWidth(editor, in: composerBody); fillWidth(controls, in: composerBody)
         composerBody.translatesAutoresizingMaskIntoConstraints = false; composer.addSubview(composerBody)
         composer.translatesAutoresizingMaskIntoConstraints = false; addSubview(composer)
         let composerWidth = composer.widthAnchor.constraint(equalTo: history.contentView.widthAnchor, constant: -32)
         composerWidth.priority = .init(490)
         NSLayoutConstraint.activate([
-            composerBody.topAnchor.constraint(equalTo: composer.topAnchor, constant: 6),
-            composerBody.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 14),
-            composerBody.trailingAnchor.constraint(equalTo: composer.trailingAnchor, constant: -14),
-            composerBody.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -14),
+            composerBody.topAnchor.constraint(equalTo: composer.topAnchor, constant: 12),
+            composerBody.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 12),
+            composerBody.trailingAnchor.constraint(equalTo: composer.trailingAnchor, constant: -12),
+            composerBody.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -12),
             composer.centerXAnchor.constraint(equalTo: history.contentView.centerXAnchor),
             composer.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
             composer.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16),
@@ -206,6 +304,85 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
 
     func stop() { runtime?.stop() }
 
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        !hasRunning && runtime?.currentConversationTransferred != true && AttachmentPasteboard.recognizes(sender.draggingPasteboard) ? .copy : []
+    }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { draggingEntered(sender) == .copy }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { receiveAttachments(sender.draggingPasteboard) }
+
+    private func chooseAttachments() {
+        guard let window else { return }
+        let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
+        panel.title = "添加图片或文件"; panel.prompt = "添加"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK else { return }
+            do { try self.addAttachments(panel.urls) }
+            catch { showError(error.localizedDescription, window: self.window) }
+        }
+    }
+
+    /// Local staging only; the runtime does not send a request until Send is pressed.
+    func addAttachments(_ urls: [URL]) throws {
+        guard let runtime, !runtime.hasRunning, !runtime.currentConversationTransferred else { throw AppError.message("请等待本轮完成，再添加附件。") }
+        let store = ChatAttachmentStore(project: project)
+        let added = try store.stageFiles(urls, existing: runtime.currentAttachments)
+        do { try runtime.setDraftAttachments(runtime.currentAttachments + added) }
+        catch { for item in added { try? store.removeDraftCopy(item) }; throw error }
+        focusInput()
+    }
+
+    func addImageAttachment(data: Data, name: String = "截图.png") throws {
+        guard let runtime, !runtime.hasRunning, !runtime.currentConversationTransferred else { throw AppError.message("请等待本轮完成，再添加附件。") }
+        let store = ChatAttachmentStore(project: project)
+        let added = try store.stageImage(data: data, name: name, existing: runtime.currentAttachments)
+        do { try runtime.setDraftAttachments(runtime.currentAttachments + [added]) }
+        catch { try? store.removeDraftCopy(added); throw error }
+        focusInput()
+    }
+
+    private func receiveAttachments(_ pasteboard: NSPasteboard) -> Bool {
+        guard let content = AttachmentPasteboard.read(pasteboard) else { return false }
+        do {
+            switch content {
+            case .files(let urls): try addAttachments(urls)
+            case .image(let data): try addImageAttachment(data: data)
+            }
+        } catch { showError(error.localizedDescription, window: window) }
+        return true
+    }
+
+    private func refreshAttachments() {
+        let items = runtime?.currentAttachments ?? []
+        let signature = (runtime?.selectedID ?? "") + items.map(\.id).joined()
+        guard signature != attachmentSignature else { return }; attachmentSignature = signature
+        attachmentHeight.constant = items.isEmpty ? 0 : AttachmentStrip.preferredHeight; attachments.isHidden = items.isEmpty
+        attachments.show(items, store: ChatAttachmentStore(project: project), remove: { [weak self] id in
+            guard let self, let runtime = self.runtime else { return }
+            let removed = runtime.currentAttachments.first { $0.id == id }
+            do {
+                try runtime.setDraftAttachments(runtime.currentAttachments.filter { $0.id != id })
+                let referenced = runtime.conversations.contains { conversation in
+                    (conversation.draftAttachments ?? []).contains { $0.id == id } || conversation.messages.contains { ($0.attachments ?? []).contains { $0.id == id } }
+                }
+                if !referenced, let removed { try? ChatAttachmentStore(project: self.project).removeDraftCopy(removed) }
+            }
+            catch { showError(error.localizedDescription, window: self.window) }
+        }, preview: { [weak self] item, sender in self?.previewAttachment(item, from: sender) })
+    }
+
+    private func previewAttachment(_ attachment: ChatAttachment, from sender: NSView) {
+        do {
+            let url = try ChatAttachmentStore(project: project).url(for: attachment)
+            let width = max(300, min(560, (window?.contentView?.bounds.width ?? 600) - 40))
+            guard let preview = QLPreviewView(frame: NSRect(x: 0, y: 0, width: width, height: 400), style: .normal) else { return }
+            preview.autostarts = true; preview.previewItem = url as NSURL
+            let controller = NSViewController(); controller.view = preview
+            let popover = NSPopover(); popover.behavior = .transient; popover.contentViewController = controller
+            popover.contentSize = NSSize(width: width, height: 400); previewPopover = popover
+            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: sender.isFlipped ? .minY : .maxY)
+        } catch { showError(error.localizedDescription, window: window) }
+    }
+
     func newConversation() {
         guard let runtime else { return }
         guard !runtime.hasRunning else {
@@ -224,17 +401,17 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let selectedID = runtime?.selectedID
         let changedConversation = displayedID != selectedID
         if changedConversation {
+            let unassignedDraft = displayedID == nil ? input.string : ""
             saveDraft(); displayedID = selectedID
-            input.string = selectedID.flatMap { drafts[$0] } ?? ""
+            input.string = selectedID.flatMap { drafts[$0] } ?? unassignedDraft
+            if let selectedID, !unassignedDraft.isEmpty { drafts[selectedID] = input.string }
             input.needsDisplay = true
-            let selectedMode = selectedID.flatMap { modes[$0] } ?? "default"
-            if let item = permissionPicker.itemArray.first(where: { $0.representedObject as? String == selectedMode }) {
-                permissionPicker.select(item)
-            }
         }
+        refreshOptions()
+        refreshAttachments()
         let visible = (runtime?.currentMessages ?? []).map { message in
             DisplayMessage(id: message.id, role: message.role, text: message.text,
-                           title: message.toolName.map(toolTitle), isError: message.role == "error")
+                           title: message.toolName.map(toolTitle), isError: message.role == "error", attachments: message.attachments ?? [])
         }
         displayMessages(visible, conversationID: selectedID ?? "", scrollToEnd: changedConversation)
         updateControls()
@@ -246,10 +423,13 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let active = hasRunning
         let needsInteraction = runtime?.needsTerminalInteraction ?? false
         let transferred = runtime?.currentConversationTransferred ?? false
-        sendButton.isEnabled = runtime != nil && !active && !transferred && !input.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        sendButton.isEnabled = runtime != nil && !active && !transferred && (!input.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || runtime?.currentAttachments.isEmpty == false)
         sendButton.isHidden = active
         stopButton.isHidden = !active
         permissionPicker.isEnabled = runtime != nil && !active && !transferred
+        modelPicker.isEnabled = permissionPicker.isEnabled
+        optionsButton.isEnabled = runtime != nil && !active
+        attachButton.isEnabled = runtime != nil && !active && !transferred
         input.isEditable = runtime != nil && !transferred
         fallbackButton.title = transferred ? "打开终端" : "在终端继续"
         fallbackButton.isHidden = transferred ? onShowTerminal == nil : (!needsInteraction || onTerminalFallback == nil)
@@ -267,7 +447,6 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     private func saveDraft() {
         guard let displayedID else { return }
         drafts[displayedID] = input.string
-        modes[displayedID] = permissionPicker.selectedItem?.representedObject as? String ?? "default"
     }
 
     func textDidChange(_ notification: Notification) {
@@ -276,23 +455,176 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
     }
 
     func selectConversation(id: String) {
-        guard let runtime, !runtime.hasRunning, runtime.conversations.contains(where: { $0.id == id }) else { return }
+        guard let runtime, !runtime.hasRunning, runtime.activeConversations.contains(where: { $0.id == id }) else { return }
         saveDraft(); runtime.select(id: id); refresh()
     }
 
-    @objc private func permissionChanged() { saveDraft() }
+    private func refreshOptions() {
+        let settings = runtime?.currentOptions ?? ChatOptions()
+        if let item = permissionPicker.itemArray.first(where: { $0.representedObject as? String == settings.permissionMode.rawValue }) { permissionPicker.select(item) }
+        if let custom = modelPicker.itemArray.first(where: { $0.tag == 99 }) { modelPicker.menu?.removeItem(custom) }
+        let model = settings.model ?? ""
+        if let item = modelPicker.itemArray.first(where: { $0.representedObject as? String == model }) { modelPicker.select(item) }
+        else {
+            let item = NSMenuItem(title: String(model.prefix(32)), action: nil, keyEquivalent: "")
+            item.representedObject = model; item.tag = 99
+            modelPicker.menu?.insertItem(item, at: 4); modelPicker.select(item)
+        }
+        modelPicker.needsDisplay = true; permissionPicker.needsDisplay = true
+    }
+
+    private func saveOptions(model: String?) {
+        guard let runtime else { return }
+        let mode = ChatPermissionMode(rawValue: permissionPicker.selectedItem?.representedObject as? String ?? "default") ?? .default
+        do { try runtime.updateOptions(model: model, permissionMode: mode, effort: runtime.currentOptions.effort) }
+        catch { showError(error.localizedDescription, window: window) }
+        refreshOptions()
+    }
+
+    @objc private func permissionChanged() { saveOptions(model: runtime?.currentOptions.model) }
+
+    @objc private func modelChanged() {
+        let model = modelPicker.selectedItem?.representedObject as? String ?? ""
+        guard model == "__custom__" else { saveOptions(model: model.isEmpty ? nil : model); return }
+        guard let window else { refreshOptions(); return }
+        let alert = NSAlert(); alert.messageText = "自定义模型"
+        alert.informativeText = "填写服务支持的模型 ID。发送时生效，不会在这里发起请求。"
+        let field = NSTextField(string: runtime?.currentOptions.model ?? "")
+        field.placeholderString = "模型 ID"; field.frame = NSRect(x: 0, y: 0, width: 320, height: 28); alert.accessoryView = field
+        alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            if response == .alertFirstButtonReturn { self.saveOptions(model: field.stringValue) }
+            else { self.refreshOptions() }
+        }
+        window.makeFirstResponder(field)
+    }
+
+    private func showCurrentActions(from sender: NSView) {
+        showConversationActions(id: runtime?.selectedID ?? "", from: sender)
+    }
+
+    func showConversationActions(id: String, from sender: NSView) {
+        guard let runtime, !runtime.hasRunning else { return }
+        let menu = NSMenu()
+        func add(_ title: String, tag: Int, symbol: String) {
+            let item = NSMenuItem(title: title, action: #selector(conversationAction(_:)), keyEquivalent: "")
+            item.target = self; item.tag = tag; item.representedObject = id
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            menu.addItem(item)
+        }
+        if id == runtime.selectedID, !runtime.currentConversationTransferred {
+            let effort = NSMenuItem(title: "思考强度", action: nil, keyEquivalent: "")
+            let levels = NSMenu()
+            for (title, value) in [("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high"), ("很高", "xhigh"), ("最高", "max")] {
+                let item = NSMenuItem(title: title, action: #selector(effortChanged(_:)), keyEquivalent: "")
+                item.target = self; item.representedObject = value
+                item.state = (runtime.currentOptions.effort ?? "") == value ? .on : .off
+                levels.addItem(item)
+            }
+            effort.submenu = levels; menu.addItem(effort); menu.addItem(.separator())
+        }
+        add("新对话", tag: 0, symbol: "square.and.pencil")
+        if runtime.activeConversations.contains(where: { $0.id == id }) {
+            add("重命名", tag: 1, symbol: "pencil")
+            add("导出对话…", tag: 2, symbol: "square.and.arrow.up")
+            add("复制对话", tag: 3, symbol: "doc.on.doc")
+            menu.addItem(.separator())
+            add("删除对话", tag: 4, symbol: "trash")
+        }
+        menu.addItem(.separator())
+        add("已删除的对话", tag: 5, symbol: "arrow.uturn.backward")
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func effortChanged(_ item: NSMenuItem) {
+        guard let runtime, let value = item.representedObject as? String else { return }
+        do { try runtime.updateOptions(model: runtime.currentOptions.model, permissionMode: runtime.currentOptions.permissionMode, effort: value.isEmpty ? nil : value) }
+        catch { showError(error.localizedDescription, window: window) }
+        optionsButton.toolTip = value.isEmpty ? "对话设置与操作" : "思考强度：" + item.title
+    }
+
+    @objc private func conversationAction(_ item: NSMenuItem) {
+        guard let runtime, !runtime.hasRunning, let id = item.representedObject as? String else { return }
+        if item.tag == 0 { newConversation(); return }
+        if item.tag == 5 { showDeletedConversations(from: optionsButton); return }
+        guard let conversation = runtime.activeConversations.first(where: { $0.id == id }) else { return }
+        switch item.tag {
+        case 1: renameConversation(conversation)
+        case 2: exportConversation(conversation)
+        case 3:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(markdown(conversation), forType: .string)
+        case 4:
+            saveDraft()
+            do { try runtime.deleteConversation(id: id); refresh() }
+            catch { showError(error.localizedDescription, window: window) }
+        default: break
+        }
+    }
+
+    private func renameConversation(_ conversation: ChatConversation) {
+        guard let window else { return }
+        let alert = NSAlert(); alert.messageText = "重命名对话"
+        let field = NSTextField(string: conversation.title)
+        field.frame = NSRect(x: 0, y: 0, width: 320, height: 28); alert.accessoryView = field
+        alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            do { try self.runtime?.renameConversation(id: conversation.id, title: field.stringValue) }
+            catch { showError(error.localizedDescription, window: self.window) }
+        }
+        window.makeFirstResponder(field)
+    }
+
+    func showDeletedConversations(from sender: NSView) {
+        guard let runtime, !runtime.hasRunning else { return }
+        let menu = NSMenu(); menu.autoenablesItems = false
+        let heading = NSMenuItem(title: runtime.deletedConversations.isEmpty ? "没有已删除的对话" : "选择对话恢复", action: nil, keyEquivalent: "")
+        heading.isEnabled = false; menu.addItem(heading)
+        for conversation in runtime.deletedConversations {
+            let item = NSMenuItem(title: conversation.title.isEmpty ? "新对话" : conversation.title, action: #selector(restoreConversation(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = conversation.id; menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func restoreConversation(_ item: NSMenuItem) {
+        guard let id = item.representedObject as? String else { return }
+        do { try runtime?.restoreConversation(id: id); refresh() }
+        catch { showError(error.localizedDescription, window: window) }
+    }
+
+    private func markdown(_ conversation: ChatConversation) -> String {
+        let roles = ["user": "你", "assistant": "Claude", "tool": "工具", "error": "提示"]
+        return "# " + conversation.title + "\n\n" + conversation.messages.map { message in
+            "## " + (message.toolName ?? roles[message.role] ?? message.role) + "\n\n" + message.text + (message.attachments ?? []).map { "\n\n附件：" + $0.name + "（" + $0.formattedSize + "）" }.joined()
+        }.joined(separator: "\n\n") + "\n"
+    }
+
+    private func exportConversation(_ conversation: ChatConversation) {
+        guard let window else { return }
+        let panel = NSSavePanel(); panel.title = "导出对话"; panel.prompt = "导出"
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        let safeTitle = conversation.title.components(separatedBy: CharacterSet(charactersIn: "/:\n\r")).joined(separator: " ")
+        panel.nameFieldStringValue = String(safeTitle.prefix(80)) + ".md"
+        let text = markdown(conversation)
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do { try text.write(to: url, atomically: true, encoding: .utf8) }
+            catch { showError(error.localizedDescription, window: self?.window) }
+        }
+    }
 
     private func send() {
         guard let runtime, !runtime.hasRunning, !runtime.currentConversationTransferred else { return }
         let text = input.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        let rawMode = permissionPicker.selectedItem?.representedObject as? String ?? "default"
-        let mode = ChatPermissionMode(rawValue: rawMode) ?? .default
+        guard !text.isEmpty || !runtime.currentAttachments.isEmpty else { return }
         let userMessages = runtime.currentMessages.filter { $0.role == "user" }.count
-        runtime.send(text: text, permissionMode: mode)
+        runtime.send(text: text)
         if runtime.hasRunning || runtime.currentMessages.filter({ $0.role == "user" }).count > userMessages {
             input.string = ""; input.needsDisplay = true
-            if let id = runtime.selectedID { drafts[id] = ""; modes[id] = rawMode }
+            if let id = runtime.selectedID { drafts[id] = "" }
         }
         refresh(); focusInput()
     }
@@ -313,7 +645,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         }
     }
 
-    private func addMessage(id: String, role: String, text: String, title: String?, isError: Bool = false) {
+    private func addMessage(id: String, role: String, text: String, title: String?, isError: Bool = false, attachments: [ChatAttachment] = []) {
         if role == "tool" {
             let expanded = expandedTools.contains(id)
             let name = title ?? "工具操作"
@@ -334,6 +666,12 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
             return
         }
         let body = column([], spacing: 8)
+        if !attachments.isEmpty {
+            let strip = AttachmentStrip(); strip.heightAnchor.constraint(equalToConstant: AttachmentStrip.preferredHeight).isActive = true
+            strip.setAccessibilityLabel("消息附件")
+            strip.show(attachments, store: ChatAttachmentStore(project: project), remove: nil, preview: { [weak self] item, sender in self?.previewAttachment(item, from: sender) })
+            fillWidth(strip, in: body)
+        }
         let content = messageText(text, color: isError ? Theme.warning : (role == "notice" ? Theme.muted : Theme.text))
         fillWidth(content, in: body)
         if role == "user" {
@@ -365,10 +703,11 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         let text: String
         let title: String?
         let isError: Bool
+        let attachments: [ChatAttachment]
     }
 
     private func displayMessages(_ items: [DisplayMessage], conversationID: String, scrollToEnd: Bool = false) {
-        let signature = conversationID + items.map { $0.id + $0.role + $0.text + ($0.title ?? "") + String($0.isError) }.joined(separator: "\u{1e}")
+        let signature = conversationID + items.map { $0.id + $0.role + $0.text + ($0.title ?? "") + String($0.isError) + $0.attachments.map(\.id).joined() }.joined(separator: "\u{1e}")
             + expandedTools.sorted().joined(separator: "\u{1f}")
         guard signature != renderedSignature else { return }
         renderedSignature = signature
@@ -377,7 +716,7 @@ final class ProjectChatView: NSView, NSTextViewDelegate {
         for view in messages.arrangedSubviews { messages.removeArrangedSubview(view); view.removeFromSuperview() }
         for message in items {
             if message.role == "user", let previous = messages.arrangedSubviews.last { messages.setCustomSpacing(32, after: previous) }
-            addMessage(id: message.id, role: message.role, text: message.text, title: message.title, isError: message.isError)
+            addMessage(id: message.id, role: message.role, text: message.text, title: message.title, isError: message.isError, attachments: message.attachments)
         }
         renderRevision += 1
         let revision = renderRevision

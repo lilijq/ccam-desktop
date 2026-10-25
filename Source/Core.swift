@@ -34,10 +34,25 @@ struct AccountUsage {
     var statusText: String {
         if status == "expired" { return "登录令牌已过期" }
         if needsLogin { return "需要登录" }
-        if let error, !error.isEmpty { return "读取失败" }
+        if status == "error" || error?.isEmpty == false { return "额度暂不可用" }
         if status == "api" || status == "api_key" { return "API 账号" }
         if windows.isEmpty { return status.isEmpty ? "暂无额度数据" : status }
         return cached ? "缓存数据" : "已读取额度"
+    }
+    var errorSummary: String? {
+        guard let error, !error.isEmpty else { return nil }
+        if needsLogin { return status == "expired" ? "登录已过期，请重新登录" : "请完成账号登录" }
+        let value = error.lowercased()
+        if value.contains("timeout") || value.contains("timed out") || value.contains("deadline exceeded") || value.contains("no response (over") {
+            return "额度查询超时，请刷新重试"
+        }
+        if value.contains("429") || value.contains("too many requests") || value.contains("retry after") {
+            return "查询过于频繁，请稍后刷新"
+        }
+        if value.contains("connection refused") || value.contains("no such host") || value.contains("network is unreachable") {
+            return "无法连接额度服务，请检查网络"
+        }
+        return "暂时无法获取额度，请稍后刷新"
     }
     static func parse(_ data: Data) throws -> [AccountUsage] {
         let object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
@@ -113,7 +128,11 @@ final class CCAMClient {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = args
-            process.environment = environment
+            // Quota probes have a known HTTPS destination and do not run project tools.
+            // macOS GUI launches do not inherit the user's shell proxy variables.
+            process.environment = args.first == "usage"
+                ? NetworkEnvironment.applyingSystemProxy(to: environment, destination: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+                : environment
             process.currentDirectoryURL = URL(fileURLWithPath: directory)
             let pipe = Pipe()
             process.standardOutput = pipe

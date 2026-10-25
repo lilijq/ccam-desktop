@@ -50,6 +50,16 @@ A native macOS workspace for CCAM, with account usage, project chat, files, Git,
 
 可用 `⌘,` 打开管理菜单，`⌘ Return` 发送消息。若没有自动找到 CCAM，可在设置中选择其可执行文件。
 
+左下角常驻并列显示当前账号与账号池总剩余，分别列出 5 小时和每周窗口；点击可展开账号面板。当前行显示百分比，总剩余以“份”显示：每个账号满额计为 1 份，再合计各账号剩余比例。它是账号额度的归一化汇总，不是 token 数或不同套餐间的等价容量。同邮箱账号保守合并，未知额度不算作零，缺失身份、部分缓存与旧缓存会明确提示。所有刷新只读取 CCAM 本机缓存，不连接 Claude，也不触发额度探针。
+
+输入框下方可选择模型（默认、Sonnet、Opus、Haiku 或自定义 ID）与模式（默认、计划、Auto、允许编辑）。更多菜单包含思考强度，设置按对话保存并沿用到后续提问与换号续做。默认模式中需要交互授权的操作可转到终端确认；原生聊天不自动放宽权限。Auto 使用 CLI 的原生权限评估；如果服务返回实际模式不同，聊天会提示回退结果。计划模式先分析和规划，修改前确认。
+
+回形针可多选图片和文件，也支持拖入文件、粘贴截图、预览与移除。附件草稿按对话保存，只有点击发送才交给 Claude。图片通过结构化图像内容发送；PDF、文档和代码文件使用独立的本机副本，Claude 可按任务读取。附件随会话和换号续做保留，历史附件失效时单独提示。当前产品限制：最多 10 个附件，图片每张 3 MB，文件每个及每批总计 20 MB。
+
+每段对话右侧的菜单提供重命名、复制、Markdown 导出和删除。删除后可从“最近对话”旁的回收站恢复，不会删除项目文件或 Claude 原生会话。
+
+参数依据本机 Claude Code 2.1.308 的定义及官方 [CLI 参数](https://code.claude.com/docs/en/cli-reference)、[模型配置](https://code.claude.com/docs/en/model-config) 和 [权限模式](https://code.claude.com/docs/en/permissions)。模型可用性与思考强度上限由所用服务决定；选择控件本身不发送请求。
+
 ## 换号续做如何工作
 
 首次任务由全局账号池选择可用订阅账号。普通追问继续使用原账号和原会话；只有 CCAM / Claude Code 的结构化额度事件才会触发换号，普通网络错误不会触发接力。
@@ -95,7 +105,7 @@ A native macOS workspace for CCAM, with account usage, project chat, files, Git,
 ./test.sh
 ```
 
-构建使用 Swift / AppKit、C PTY 桥接和仓库内的 SwiftTerm 源码，不需要 Node.js 或网页服务器。`build.sh` 在临时目录完成签名，再生成 `CCAM Desktop.app` 和不含扩展元数据的 `CCAM Desktop.app.zip`。位于云同步文件夹时，建议使用压缩包解压安装。
+构建使用 Swift / AppKit、C PTY 桥接和仓库内的 SwiftTerm 源码，不需要 Node.js 或网页服务器。`build.sh` 在临时目录完成签名，再生成 `CCAM Desktop.app` 和不含扩展元数据的 `CCAM Desktop.app.zip`。位于云同步文件夹时，建议使用压缩包解压安装。设置 `CCAM_BUILD_COPY_APP=0` 可只生成压缩包，避免项目目录的应用副本出现在系统搜索中。
 
 ```text
 Source/          原生界面、账号接力、浏览器路由、文件与 Git

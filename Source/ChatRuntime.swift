@@ -63,18 +63,26 @@ final class ChatRuntime {
     private var identity: PoolChatIdentity?
     private var quota: PoolLimitEvent?
     private var runConversationID: String?
-    private var permissionMode: ChatPermissionMode = .default
+    private var runOptions = ChatOptions()
+    private var runAttachments: [ChatAttachment] = []
+    private var initialInput: Data?
+    private var effectivePermissionMode: String?
     private var waitingSince: Date?
     private var attemptedQuotaTickets = Set<String>()
     private var recovery = false
 
     var currentMessages: [ChatMessage] { currentConversation?.messages ?? [] }
     var currentConversationTransferred: Bool { currentConversation?.transferredToTerminal ?? false }
-    private var currentConversation: ChatConversation? { conversations.first { $0.id == selectedID } }
+    var activeConversations: [ChatConversation] { conversations.filter { $0.deletedAt == nil } }
+    var deletedConversations: [ChatConversation] { conversations.filter { $0.deletedAt != nil }.sorted { $0.deletedAt! > $1.deletedAt! } }
+    var currentConversation: ChatConversation? { activeConversations.first { $0.id == selectedID } }
+    var currentOptions: ChatOptions { currentConversation?.options ?? ChatOptions() }
+    var currentAttachments: [ChatAttachment] { currentConversation?.draftAttachments ?? [] }
     var terminalFallback: ChatTerminalTarget {
         ChatTerminalTarget(directory: project.path, sessionID: currentConversation?.sessionID,
                            account: currentConversation?.account, ticket: currentConversation?.ticket,
-                           canResume: currentConversation?.continuityUnavailable != true)
+                           canResume: currentConversation?.continuityUnavailable != true,
+                           model: currentOptions.model, permissionMode: currentOptions.permissionMode.rawValue, effort: currentOptions.effort)
     }
 
     init(project: ProjectRecord, store: ChatStore? = nil, ccamExecutable: String = CCAMClient.executable,
@@ -102,10 +110,90 @@ final class ChatRuntime {
     }
 
     func select(id: String) {
-        guard !hasRunning, conversations.contains(where: { $0.id == id }) else { return }
+        guard !hasRunning, activeConversations.contains(where: { $0.id == id }) else { return }
         selectedID = id; needsTerminalInteraction = false
         stateText = currentConversationTransferred ? "已转到终端，此聊天记录为只读" : "继续这段对话"
         persist(); changed()
+    }
+
+    func updateOptions(model: String?, permissionMode: ChatPermissionMode, effort: String? = nil) throws {
+        guard !hasRunning else { throw AppError.message("请等待本轮完成或先停止，再修改模型与模式。") }
+        let validatedModel = try GlobalPool.validatedChatModel(model)
+        let effort = try GlobalPool.validatedChatEffort(effort)
+        var updated = conversations
+        let id: String
+        if let selectedID, let index = updated.firstIndex(where: { $0.id == selectedID && $0.deletedAt == nil }) {
+            guard !updated[index].transferredToTerminal else { throw AppError.message("请在终端修改这段对话的设置。") }
+            id = selectedID
+            updated[index].options = ChatOptions(model: validatedModel, permissionMode: permissionMode, effort: effort)
+            updated[index].updatedAt = Date()
+        } else {
+            let conversation = ChatConversation(id: UUID().uuidString, title: "新对话", projectID: project.id.uuidString, directory: project.path,
+                                                options: ChatOptions(model: validatedModel, permissionMode: permissionMode, effort: effort))
+            id = conversation.id; updated.insert(conversation, at: 0)
+        }
+        try saveMetadata(updated, selectedID: id)
+    }
+
+    func renameConversation(id: String, title: String) throws {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 120, !trimmed.contains(where: { $0.isNewline }) else { throw AppError.message("名称需为 1–120 个字符，不能换行。") }
+        guard let index = conversations.firstIndex(where: { $0.id == id && $0.deletedAt == nil }) else { throw AppError.message("这段对话已不存在。") }
+        var updated = conversations; updated[index].title = trimmed; updated[index].updatedAt = Date()
+        try saveMetadata(updated, selectedID: selectedID)
+    }
+
+    func setDraftAttachments(_ attachments: [ChatAttachment]) throws {
+        guard !hasRunning, !currentConversationTransferred else { throw AppError.message("请等待本轮完成，再修改附件。") }
+        try ChatAttachmentStore(project: project).validate(attachments)
+        var updated = conversations
+        let id: String
+        if let selectedID, let index = updated.firstIndex(where: { $0.id == selectedID && $0.deletedAt == nil }) {
+            id = selectedID; updated[index].draftAttachments = attachments
+        } else {
+            let conversation = ChatConversation(id: UUID().uuidString, title: "新对话", projectID: project.id.uuidString, directory: project.path, draftAttachments: attachments)
+            id = conversation.id; updated.insert(conversation, at: 0)
+        }
+        try saveMetadata(updated, selectedID: id)
+    }
+
+    private func attachmentInput(text: String, attachments: [ChatAttachment]) throws -> Data {
+        let store = ChatAttachmentStore(project: project)
+        try store.validate(attachments)
+        var blocks: [[String: Any]] = [["type": "text", "text": text]]
+        for attachment in attachments {
+            if attachment.isImage { blocks.append(try store.imageContentBlock(for: attachment)) }
+            else { blocks.append(["type": "text", "text": try store.fileReference(for: attachment)]) }
+        }
+        let message: [String: Any] = ["type": "user", "parent_tool_use_id": NSNull(), "message": ["role": "user", "content": blocks]]
+        var data = try JSONSerialization.data(withJSONObject: message)
+        data.append(0x0A)
+        return data
+    }
+
+    /// Deletion only moves the desktop record to its recoverable deleted list.
+    /// Native Claude transcripts and project files are never removed.
+    func deleteConversation(id: String) throws {
+        guard !(hasRunning && runConversationID == id) else { throw AppError.message("请先停止这段对话，再删除。") }
+        guard let index = conversations.firstIndex(where: { $0.id == id && $0.deletedAt == nil }) else { throw AppError.message("这段对话已不存在。") }
+        var updated = conversations; updated[index].deletedAt = Date(); updated[index].updatedAt = Date()
+        let selection = selectedID == id ? updated.first(where: { $0.deletedAt == nil })?.id : selectedID
+        try saveMetadata(updated, selectedID: selection)
+    }
+
+    func restoreConversation(id: String) throws {
+        guard let index = conversations.firstIndex(where: { $0.id == id && $0.deletedAt != nil }) else { throw AppError.message("未找到这段已删除的对话。") }
+        var updated = conversations; updated[index].deletedAt = nil; updated[index].updatedAt = Date()
+        try saveMetadata(updated, selectedID: hasRunning ? selectedID : id)
+    }
+
+    private func saveMetadata(_ updated: [ChatConversation], selectedID: String?) throws {
+        // Commit first: a failed disk write must not hide a conversation in memory.
+        try store.save(updated, selectedID: selectedID)
+        if self.selectedID != store.selectedID && !hasRunning { needsTerminalInteraction = false }
+        conversations = updated; self.selectedID = store.selectedID
+        if !hasRunning { stateText = currentConversationTransferred ? "已转到终端，此聊天记录为只读" : currentConversation == nil ? "可以开始新任务" : "继续这段对话" }
+        changed()
     }
 
     func markTransferredToTerminal() {
@@ -114,19 +202,31 @@ final class ChatRuntime {
         stateText = "已转到终端，此聊天记录为只读"; persist(); changed()
     }
 
-    func send(text: String, permissionMode: ChatPermissionMode = .default) {
-        guard !hasRunning, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    func send(text: String, permissionMode: ChatPermissionMode? = nil) {
+        let attachments = currentAttachments
+        guard !hasRunning, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else { return }
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "请查看附件。" : text
         if selectedID == nil { createConversation() }
         guard let conversation = currentConversation else { return }
         guard !conversation.transferredToTerminal else { state("已转到终端，请在终端继续或新建对话"); return }
         guard conversation.continuityUnavailable != true else { state("无法验证原会话身份，请新建对话；不会猜测最近会话"); return }
         guard project.directoryExists else { state("项目文件夹不存在"); return }
         guard conversation.sessionID == nil || conversation.account != nil else { state("原会话的账号身份未确认，不能安全继续"); return }
-        runConversationID = conversation.id; self.permissionMode = permissionMode; needsTerminalInteraction = false
+        var options = currentOptions
+        if let permissionMode { options.permissionMode = permissionMode }
+        do {
+            options.model = try GlobalPool.validatedChatModel(options.model)
+            options.effort = try GlobalPool.validatedChatEffort(options.effort)
+            initialInput = attachments.isEmpty ? nil : try attachmentInput(text: text, attachments: attachments)
+        }
+        catch { state(error.localizedDescription); return }
+        runConversationID = conversation.id; runOptions = options; runAttachments = attachments; needsTerminalInteraction = false
         attemptedQuotaTickets.removeAll(); waitingSince = nil; generation += 1; hasRunning = true
         mutate(conversation.id) { item in
-            if item.messages.isEmpty { item.title = String(text.split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(48) ?? "新对话".prefix(48)) }
-            item.messages.append(ChatMessage(role: "user", text: text))
+            item.options = options
+            if item.messages.isEmpty && item.title == "新对话" { item.title = String(text.split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(48) ?? "新对话".prefix(48)) }
+            item.messages.append(ChatMessage(role: "user", text: text, attachments: attachments.isEmpty ? nil : attachments))
+            item.draftAttachments = nil
         }
         persist(); changed()
         launch(prompt: text, ticket: conversation.ticket, automatic: false, generation: generation)
@@ -151,23 +251,55 @@ final class ChatRuntime {
     private func launch(prompt: String, ticket: String?, automatic: Bool, generation expected: Int) {
         guard generation == expected, hasRunning, let id = runConversationID, let conversation = conversations.first(where: { $0.id == id }) else { return }
         do {
-            let prepared = try GlobalPool.prepareChat(directory: project.path, account: conversation.account, sessionID: conversation.sessionID,
+            let base = try GlobalPool.prepareChat(directory: project.path, account: conversation.account, sessionID: conversation.sessionID,
                                                        newSessionID: conversation.sessionID == nil ? UUID().uuidString : nil, ticket: ticket,
-                                                       permissionMode: permissionMode.rawValue, helperExecutable: helper, ccamExecutable: executable, baseEnvironment: environment)
+                                                       permissionMode: runOptions.permissionMode.rawValue, model: runOptions.model, effort: runOptions.effort, helperExecutable: helper, ccamExecutable: executable, baseEnvironment: environment)
+            var extra: [String] = []
+            let store = ChatAttachmentStore(project: project)
+            // File copies remain readable in resumed turns and after account handoff.
+            // Each --add-dir scope contains only that one selected attachment.
+            var directories = Set<String>()
+            var unavailable: [String] = []
+            var seen = Set<String>()
+            do {
+                for attachment in conversation.messages.flatMap({ $0.attachments ?? [] }) where !attachment.isImage {
+                    guard seen.insert(attachment.id).inserted else { continue }
+                    do {
+                        for directory in try store.readableDirectories(for: [attachment]) { directories.insert(directory) }
+                    } catch {
+                        if !automatic && runAttachments.contains(where: { $0.id == attachment.id }) { throw error }
+                        unavailable.append(attachment.name)
+                    }
+                }
+            } catch { GlobalPool.clean(base); throw error }
+            if !unavailable.isEmpty {
+                append(role: "notice", text: "历史附件已变更或丢失：" + unavailable.prefix(3).joined(separator: "、") + "。重新添加后可继续引用，对话仍可继续。")
+            }
+            let structured = !automatic && !runAttachments.isEmpty
+            if structured { extra += ["--input-format", "stream-json"] }
+            if !directories.isEmpty { extra += ["--add-dir"] + directories.sorted() }
+            let prepared = PoolLaunch(args: base.args + extra, environment: base.environment, eventDirectory: base.eventDirectory,
+                                      token: base.token, directory: base.directory, createdAt: base.createdAt, ticket: base.ticket,
+                                      automaticallyContinuesTask: base.automaticallyContinuesTask, helperExecutable: base.helperExecutable)
+            let inputData = structured ? (initialInput ?? Data(prompt.utf8)) : Data(prompt.utf8)
             do { try beforeStart?(prepared.args) } catch { GlobalPool.clean(prepared); throw error }
             guard generation == expected, hasRunning else { GlobalPool.clean(prepared); return }
             plan = prepared; identity = nil; quota = nil; recovery = automatic
+            effectivePermissionMode = nil
             decoder = ChatStreamDecoder(); streamMessageID = nil; streamSessionID = nil; streamTextIndex = 0; assistantIDs.removeAll(); finalizedAssistantKeys.removeAll(); toolIDs.removeAll(); lastAssistantID = nil
             receivedResult = false; resultFailed = false; identityMismatch = false
             let child = Process(); child.executableURL = URL(fileURLWithPath: executable); child.arguments = prepared.args
             child.currentDirectoryURL = URL(fileURLWithPath: project.path); child.environment = prepared.environment
             let input = Pipe(), output = Pipe(), errors = Pipe()
+            // A CLI rejecting a mode can close stdin before a large image finishes.
+            // Treat that as an I/O error instead of terminating the desktop app.
+            _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
             child.standardInput = input; child.standardOutput = output; child.standardError = errors
             try child.run(); process = child
             state(automatic ? "已切换账号，正在接续未完成任务" : "正在处理")
             poll = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.readHooks(expected) }
             DispatchQueue.global(qos: .userInitiated).async {
-                try? input.fileHandleForWriting.write(contentsOf: Data(prompt.utf8)); try? input.fileHandleForWriting.close()
+                try? input.fileHandleForWriting.write(contentsOf: inputData); try? input.fileHandleForWriting.close()
             }
             let drained = DispatchGroup(); drained.enter()
             DispatchQueue.global(qos: .utility).async {
@@ -229,6 +361,17 @@ final class ChatRuntime {
         switch type {
         case "system":
             if event["subtype"] as? String == "init", let sid = event["session_id"] as? String, UUID(uuidString: sid) != nil { streamSessionID = sid }
+            if ["init", "status"].contains(event["subtype"] as? String ?? ""),
+               let effective = event["permissionMode"] as? String, effective != effectivePermissionMode {
+                let previous = effectivePermissionMode
+                effectivePermissionMode = effective
+                if runOptions.permissionMode == .auto, effective != "auto" {
+                    let title = ["default": "默认模式", "manual": "默认模式", "plan": "计划模式", "acceptEdits": "允许编辑"][effective] ?? "其他权限模式"
+                    append(role: "notice", text: previous == nil
+                           ? "当前模型或服务未启用 Auto，实际使用\(title)。需要确认的操作仍会暂停。"
+                           : "当前已切换到\(title)。")
+                }
+            }
         case "stream_event":
             guard let inner = event["event"] as? [String: Any] else { return }
             let kind = inner["type"] as? String
@@ -284,6 +427,7 @@ final class ChatRuntime {
         let message = ChatMessage(role: "tool", text: "正在使用 \(name)", toolName: name); toolIDs[key] = message.id; append(message)
     }
     private func finished(_ code: Int32, _ expected: Int) {
+        defer { if !hasRunning { initialInput = nil; runAttachments = [] } }
         if stoppingGeneration == expected {
             captureIdentity()
             if (identity == nil || identityMismatch), let id = runConversationID {

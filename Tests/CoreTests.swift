@@ -21,7 +21,12 @@ import Foundation
         check(values[1].needsLogin && values[1].windows.isEmpty, "logged out has no synthetic quota")
         check(values[2].statusText == "API 账号", "API account has no subscription quota")
         check(values[3].needsLogin && values[3].windows.count == 1, "expired login retains cached limits")
-        check(values[4].statusText == "读取失败", "server error is explicit")
+        check(values[4].statusText == "额度暂不可用", "quota error is distinct from login status")
+        check(values[4].errorSummary == "查询过于频繁，请稍后刷新", "rate limit describes the lookup rather than account quota")
+        let network = AccountUsage(name: "network", status: "error", error: "Get https://example.invalid/: net/http: TLS handshake timeout", windows: [], raw: [:])
+        check(!network.needsLogin && network.statusText == "额度暂不可用", "network failure never asks the user to log in again")
+        check(network.errorSummary == "额度查询超时，请刷新重试", "network timeout has an actionable quota message")
+        check(values[3].errorSummary == "登录已过期，请重新登录", "expired authentication still requires login")
         do { _ = try AccountUsage.parse(Data("{}".utf8)); check(false, "invalid shape rejected") } catch { check(true, "invalid shape") }
         let accounts = try JSONDecoder().decode([Account].self, from: Data(#"[{"name":"work","default":true,"email":"","groups":[]}]"#.utf8))
         check(accounts[0].isDefault == true, "default account maps correctly")

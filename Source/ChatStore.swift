@@ -1,10 +1,16 @@
 import Foundation
 
 enum ChatPermissionMode: String, CaseIterable, Codable {
-    case `default`, plan, acceptEdits
+    case `default`, plan, acceptEdits, auto
     var title: String {
-        switch self { case .default: return "按需确认"; case .plan: return "只读规划"; case .acceptEdits: return "允许编辑" }
+        switch self { case .default: return "按需确认"; case .plan: return "计划模式"; case .acceptEdits: return "允许编辑"; case .auto: return "Auto 模式" }
     }
+}
+
+struct ChatOptions: Codable, Equatable {
+    var model: String? = nil
+    var permissionMode: ChatPermissionMode = .default
+    var effort: String? = nil
 }
 
 struct ChatMessage: Identifiable, Codable, Equatable {
@@ -12,6 +18,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var role: String
     var text: String
     var toolName: String? = nil
+    var attachments: [ChatAttachment]? = nil
 }
 
 struct ChatConversation: Identifiable, Codable, Equatable {
@@ -25,6 +32,9 @@ struct ChatConversation: Identifiable, Codable, Equatable {
     var ticket: String?
     var transferredToTerminal = false
     var continuityUnavailable: Bool? = nil
+    var options: ChatOptions? = nil
+    var deletedAt: Date? = nil
+    var draftAttachments: [ChatAttachment]? = nil
     var updatedAt = Date()
 }
 
@@ -59,7 +69,8 @@ final class ChatStore {
             throw AppError.message("聊天记录与当前项目不匹配，未载入其他项目的对话。")
         }
         conversations = document.conversations
-        selectedID = conversations.contains { $0.id == document.selectedID } ? document.selectedID : conversations.first?.id
+        let active = conversations.filter { $0.deletedAt == nil }
+        selectedID = active.contains { $0.id == document.selectedID } ? document.selectedID : active.first?.id
     }
 
     func save(_ conversations: [ChatConversation], selectedID: String?) throws {
@@ -68,13 +79,15 @@ final class ChatStore {
             copy.messages = copy.messages.map { message in var copy = message; copy.text = Self.redacted(copy.text); return copy }
             return copy
         }
+        let active = safeConversations.filter { $0.deletedAt == nil }
+        let safeSelectedID = active.contains { $0.id == selectedID } ? selectedID : active.first?.id
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(Document(version: 1, projectID: project.id.uuidString, directory: project.path, conversations: safeConversations, selectedID: selectedID))
+        let data = try encoder.encode(Document(version: 1, projectID: project.id.uuidString, directory: project.path, conversations: safeConversations, selectedID: safeSelectedID))
         let directory = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try data.write(to: fileURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-        self.conversations = safeConversations; self.selectedID = selectedID
+        self.conversations = safeConversations; self.selectedID = safeSelectedID
     }
 
     /// Redact known credential forms in the app's additional saved copy only.

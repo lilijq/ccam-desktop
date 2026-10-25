@@ -45,6 +45,9 @@ struct ChatTerminalTarget {
     let account: String?
     let ticket: String?
     var canResume = true
+    var model: String? = nil
+    var permissionMode = "default"
+    var effort: String? = nil
 }
 
 enum GlobalPool {
@@ -144,12 +147,39 @@ enum GlobalPool {
 
     /// Print turns preserve the owning account until a real quota handoff. Native
     /// `next --note` supplies the exact transcript and forks only when necessary.
-    static func prepareChat(directory: String, account: String?, sessionID: String?, newSessionID: String?, ticket: String?, permissionMode: String,
+    static func validatedChatModel(_ model: String?) throws -> String? {
+        guard let model else { return nil }
+        let value = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty || value == "default" { return nil }
+        guard value.range(of: #"^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,255}$"#, options: .regularExpression) != nil else {
+            throw AppError.message("模型名称无效，请使用模型别名或完整模型 ID。")
+        }
+        return value
+    }
+
+    static func validatedChatEffort(_ effort: String?) throws -> String? {
+        guard let effort, !effort.isEmpty, effort != "default" else { return nil }
+        guard ["low", "medium", "high", "xhigh", "max"].contains(effort) else { throw AppError.message("思考强度无效。") }
+        return effort
+    }
+
+    static func validatedChatPermissionMode(_ mode: String, interactive: Bool = false) throws -> String {
+        switch mode {
+        case "default": return interactive ? "default" : "manual"
+        case "plan", "acceptEdits", "auto": return mode
+        default: throw AppError.message("权限模式无效，请重新选择。")
+        }
+    }
+
+    static func prepareChat(directory: String, account: String?, sessionID: String?, newSessionID: String?, ticket: String?, permissionMode: String, model: String? = nil, effort: String? = nil,
                             helperExecutable: String = CommandLine.arguments[0], ccamExecutable: String = CCAMClient.executable,
                             baseEnvironment: [String: String] = CCAMClient.environment) throws -> PoolLaunch {
         if let ticket { _ = try recoveryArguments(ticket: ticket, directory: directory, environment: baseEnvironment) }
         if let account, account.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) == nil { throw AppError.message("会话账号无效。") }
         if let sessionID, UUID(uuidString: sessionID) == nil { throw AppError.message("无法恢复这个会话标识。") }
+        let model = try validatedChatModel(model)
+        let effort = try validatedChatEffort(effort)
+        let permission = try validatedChatPermissionMode(permissionMode)
         let base = try prepare(directory: directory, continueLast: ticket != nil, ticket: ticket,
                                helperExecutable: helperExecutable, ccamExecutable: ccamExecutable, baseEnvironment: baseEnvironment)
         let hook: [String: Any] = ["type": "command", "command": Shell.quote(base.helperExecutable) + " " + chatHelperFlag, "timeout": 15]
@@ -158,7 +188,10 @@ enum GlobalPool {
         var prefix = Array(base.args.prefix { $0 != "--" })
         if ticket == nil, let account { prefix = ["run", account] }
         var claude = ["--print", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompts", "none",
-                      "--permission-mode", ["plan", "acceptEdits"].contains(permissionMode) ? permissionMode : "manual", "--settings", json]
+                      "--permission-mode", permission, "--settings", json]
+        // Explicit default clears a model override retained by a resumed session.
+        claude += ["--model", model ?? "default"]
+        if let effort { claude += ["--effort", effort] }
         if ticket == nil {
             if let sessionID { claude += ["--resume", sessionID] }
             else if let newSessionID, UUID(uuidString: newSessionID) != nil { claude += ["--session-id", newSessionID] }
@@ -170,17 +203,24 @@ enum GlobalPool {
 
     static func prepareChatTerminal(target: ChatTerminalTarget) throws -> PoolLaunch {
         guard target.canResume else { throw AppError.message("这段对话的身份未能验证，不能安全转到终端。请新建对话。") }
-        if let ticket = target.ticket { return try prepare(directory: target.directory, continueLast: true, ticket: ticket) }
-        let base = try prepare(directory: target.directory, continueLast: false)
-        guard let sessionID = target.sessionID else { return base }
+        let model = try validatedChatModel(target.model), effort = try validatedChatEffort(target.effort)
+        var options = ["--permission-mode", try validatedChatPermissionMode(target.permissionMode, interactive: true)]
+        options += ["--model", model ?? "default"]
+        if let effort { options += ["--effort", effort] }
+        let base = try prepare(directory: target.directory, continueLast: target.ticket != nil, ticket: target.ticket)
+        func configured(_ args: [String]) -> PoolLaunch {
+            PoolLaunch(args: args + options, environment: base.environment, eventDirectory: base.eventDirectory, token: base.token,
+                       directory: base.directory, createdAt: base.createdAt, ticket: base.ticket,
+                       automaticallyContinuesTask: base.automaticallyContinuesTask, helperExecutable: base.helperExecutable)
+        }
+        if target.ticket != nil || target.sessionID == nil { return configured(base.args) }
+        let sessionID = target.sessionID!
         guard UUID(uuidString: sessionID) != nil, let account = target.account,
               account.range(of: "^[a-z0-9][a-z0-9_-]{0,31}$", options: .regularExpression) != nil else {
             clean(base); throw AppError.message("原会话的账号身份不完整，无法安全接续。")
         }
         let claude = Array(base.args.drop(while: { $0 != "--" }).dropFirst())
-        return PoolLaunch(args: ["run", account, "--", "--resume", sessionID] + claude, environment: base.environment,
-                          eventDirectory: base.eventDirectory, token: base.token, directory: base.directory, createdAt: base.createdAt,
-                          ticket: nil, automaticallyContinuesTask: false, helperExecutable: base.helperExecutable)
+        return configured(["run", account, "--", "--resume", sessionID] + claude)
     }
 
     static func readChatIdentity(_ launch: PoolLaunch, rootPID: Int32) -> PoolChatIdentity? {

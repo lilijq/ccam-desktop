@@ -1,0 +1,145 @@
+import Foundation
+
+/// Offline quota arithmetic. A "份" is a fraction of one account's own full
+/// window, not a shared token balance or a capacity-weighted subscription total.
+struct QuotaSummary {
+    let title: String
+    let detail: String
+    let tooltip: String
+    let currentAccountName: String?
+    let currentFiveHour: String
+    let currentWeekly: String
+    let totalFiveHour: String
+    let totalWeekly: String
+    let poolCoverage: String
+    let cacheLabel: String
+
+    static func make(accounts: [Account], usage: [AccountUsage], now: Date = Date(), preferredAccount: String? = nil) -> QuotaSummary {
+        let offline = "仅显示本机缓存，不连接 Claude。实际可用量可能已变化。"
+        // CCAM profile names are unique, but reject duplicate rows defensively.
+        var seen = Set<String>()
+        let accounts = accounts.filter { seen.insert($0.name).inserted }
+        guard !accounts.isEmpty else {
+            return QuotaSummary(title: "暂无账号", detail: "账号与额度", tooltip: offline,
+                                currentAccountName: nil, currentFiveHour: "--", currentWeekly: "--",
+                                totalFiveHour: "--", totalWeekly: "--", poolCoverage: "0 个账号", cacheLabel: "暂无缓存")
+        }
+        let names = Set(accounts.map(\.name))
+        let reports = usage.filter { names.contains($0.name) }
+        // Choose the newest record, never combine multiple readings of one account.
+        func latest(_ candidates: [AccountUsage]) -> AccountUsage? {
+            candidates.enumerated().max { lhs, rhs in
+                let a = lhs.element.measuredAt.flatMap(parseDate) ?? .distantPast
+                let b = rhs.element.measuredAt.flatMap(parseDate) ?? .distantPast
+                return a == b ? lhs.offset < rhs.offset : a < b
+            }?.element
+        }
+        let byName = Dictionary(grouping: reports, by: \.name).compactMapValues(latest)
+        let current = accounts.first { $0.name == preferredAccount }
+            ?? accounts.first { $0.isDefault == true } ?? accounts[0]
+        let report = byName[current.name]
+        func window(_ report: AccountUsage?, _ label: String) -> UsageWindow? {
+            report?.windows.first { $0.label == label && $0.used.isFinite }
+        }
+        let five = window(report, "5 小时额度"), week = window(report, "每周额度")
+        let currentFive = five.map { percentage($0.used) } ?? "--"
+        let currentWeek = week.map { percentage($0.used) } ?? "--"
+        let pieces = [("5h", five), ("周", week)].compactMap { prefix, value -> String? in
+            value.map { prefix + " " + percentage($0.used) }
+        }
+        let title: String
+        if !pieces.isEmpty { title = pieces.joined(separator: " · ") }
+        else if report?.needsLogin == true { title = "需要登录" }
+        else if let report, ["api", "api_key"].contains(report.status) { title = "API 账号" }
+        else if report?.windows.contains(where: { $0.used.isFinite }) == true { title = "已保存模型额度" }
+        else { title = "额度未知" }
+
+        func normalizedEmail(_ account: Account) -> String? {
+            let email = account.email?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            return email.isEmpty ? nil : email
+        }
+        // The public account model has no organization/identity UUID. Same-email
+        // profiles are counted once conservatively; the limitation is disclosed.
+        let groups = Dictionary(grouping: accounts) { account in
+            normalizedEmail(account).map { "email:" + $0 } ?? "profile:" + account.name
+        }
+        let poolReports = groups.values.compactMap { group in latest(group.compactMap { byName[$0.name] }) }
+        let fiveWindows = poolReports.compactMap { window($0, "5 小时额度") }
+        let weekWindows = poolReports.compactMap { window($0, "每周额度") }
+        let count = groups.count
+        let coverage: String
+        if fiveWindows.count == count && weekWindows.count == count { coverage = "\(count) 个账号" }
+        else if fiveWindows.count == weekWindows.count { coverage = "部分缓存 \(fiveWindows.count)/\(count)" }
+        else { coverage = "部分缓存" }
+        let knownReports = poolReports.filter { $0.windows.contains { $0.used.isFinite } }
+        let oldReports = knownReports.filter { isOld($0, now: now) }
+        let displayedReports = knownReports + (report.map { [$0] } ?? [])
+        let dates = displayedReports.compactMap { $0.measuredAt.flatMap(parseDate) }
+        let cache: String
+        if knownReports.isEmpty { cache = "暂无缓存" }
+        else { cache = marker(old: displayedReports.contains { isOld($0, now: now) }, date: dates.min()) }
+        let currentMarker = report.map { marker(old: isOld($0, now: now), date: $0.measuredAt.flatMap(parseDate)) } ?? "暂无缓存"
+
+        var lines = ["\(current.name) 的剩余额度（缓存）"]
+        if let report {
+            for value in report.windows where value.used.isFinite { lines.append("\(value.label)：\(percentage(value.used))") }
+            if let date = report.measuredAt.flatMap(parseDate) {
+                lines.append("记录时间：" + DateFormatter.localizedString(from: date, dateStyle: .short, timeStyle: .short))
+            } else { lines.append("记录时间未知") }
+            if report.needsLogin { lines.append("此账号需要登录；缓存不代表登录状态。") }
+            else if report.status == "error" || report.error?.isEmpty == false { lines.append("上次读取未成功，保留此前数值。") }
+        } else { lines.append("此账号暂无额度缓存。") }
+        lines.append("\(accounts.count) 个账号，\(byName.values.filter { $0.windows.contains { $0.used.isFinite } }.count) 个有额度缓存")
+        lines += ["", "账号池总剩余（缓存）", "5 小时：\(portions(fiveWindows))，覆盖 \(fiveWindows.count)/\(count) 个账号",
+                  "每周：\(portions(weekWindows))，覆盖 \(weekWindows.count)/\(count) 个账号",
+                  "1 份 = 一个账号自身的满额度。按各账号剩余比例相加，不表示 token、金额或统一容量。",
+                  "5 小时和每周分开合计，不互相相加；各账号按自己的时间重置。未知额度未计入，不能当作 0。"]
+        let plans = Set(accounts.compactMap { $0.plan?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty })
+        if plans.count > 1 || accounts.contains(where: { $0.plan?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false }) {
+            lines.append("套餐不同或未确认，每份的实际容量可能不同，合计未按套餐加权。")
+        }
+        if groups.count < accounts.count { lines.append("同邮箱的多个账号仅计一份，采用最近缓存；不同组织的独立额度无法从本机字段确认。") }
+        if accounts.contains(where: { normalizedEmail($0) == nil }) { lines.append("部分账号未提供邮箱，按独立账号计；身份去重尚未完全确认。") }
+        if !oldReports.isEmpty { lines.append("合计包含 \(oldReports.count) 个账号的旧缓存；过期、读取失败或已过重置时间的数值不会自动补满。") }
+        if knownReports.contains(where: \.needsLogin) { lines.append("合计包含需要重新登录的账号历史额度，不代表现在可执行。") }
+        lines.append(offline)
+        return QuotaSummary(title: title, detail: current.name + " · " + currentMarker, tooltip: lines.joined(separator: "\n"),
+                            currentAccountName: current.name, currentFiveHour: currentFive, currentWeekly: currentWeek,
+                            totalFiveHour: portions(fiveWindows), totalWeekly: portions(weekWindows), poolCoverage: coverage, cacheLabel: cache)
+    }
+
+    private static func remaining(_ used: Double) -> Double { max(0, min(100, 100 - used)) }
+    private static func percentage(_ used: Double) -> String {
+        let value = remaining(used)
+        if value > 0 && value < 1 { return "<1%" }
+        return String(format: "%.0f%%", floor(value))
+    }
+    private static func portions(_ windows: [UsageWindow]) -> String {
+        guard !windows.isEmpty else { return "--" }
+        let value = windows.reduce(0) { $0 + remaining($1.used) / 100 }
+        if value > 0 && value < 0.01 { return "<0.01份" }
+        // Avoid both overstating a fraction and dropping 1.20 to 1.19 due to
+        // binary floating-point representation of exact hundredths.
+        return String(format: "%.2f份", floor(value * 100 + 1e-9) / 100)
+    }
+    private static func isOld(_ report: AccountUsage, now: Date) -> Bool {
+        guard !report.needsLogin, report.status != "error", report.error?.isEmpty != false,
+              let date = report.measuredAt.flatMap(parseDate), date <= now, now.timeIntervalSince(date) < 3600 else { return true }
+        return report.windows.contains { value in
+            guard let raw = value.reset else { return false }
+            guard let reset = parseDate(raw) else { return true }
+            return reset <= now
+        }
+    }
+    private static func marker(old: Bool, date: Date?) -> String {
+        var value = old ? "旧缓存" : "缓存"
+        if let date { let formatter = DateFormatter(); formatter.dateFormat = "HH:mm"; value += " " + formatter.string(from: date) }
+        return value
+    }
+    private static func parseDate(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions.insert(.withFractionalSeconds)
+        return formatter.date(from: value)
+    }
+}

@@ -67,7 +67,7 @@ enum PoolTests {
             let fake = root.appendingPathComponent("fakeclaude.py")
             try Self.fake.write(to: fake, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
-            var config = "claude_bin = '\(fake.path)'\ndefault = 'second'\n[[profile]]\nname = 'first'\nslot = 1\n[[profile]]\nname = 'second'\nslot = 2\n[[folder]]\npath = '\(project.path)'\naccount = 'second'\n"
+            var config = "usage_source = 'cache'\nclaude_bin = '\(fake.path)'\ndefault = 'second'\n[[profile]]\nname = 'first'\nslot = 1\n[[profile]]\nname = 'second'\nslot = 2\n[[folder]]\npath = '\(project.path)'\naccount = 'second'\n"
             if mode == "consecutive" { config += "[[profile]]\nname = 'third'\nslot = 3\n" }
             try write("config/config.toml", Data(config.utf8))
             for (name, percent) in [("first", 10.0), ("second", secondPercent)] + (mode == "consecutive" ? [("third", 60.0)] : []) {
@@ -160,6 +160,18 @@ os.execv(os.environ['POOL_TEST_NATIVE'],[os.environ['POOL_TEST_NATIVE']]+args)
 
     static func main() throws {
         if let code = GlobalPool.handleHelperInvocation() { exit(code) }
+        let standardPrint = try GlobalPool.validatedChatPermissionMode("default")
+        let standardTerminal = try GlobalPool.validatedChatPermissionMode("default", interactive: true)
+        check(standardPrint == "manual" && standardTerminal == "default", "standard mode retains the headless and interactive permission behavior")
+        for mode in ["plan", "acceptEdits", "auto"] {
+            let headless = try GlobalPool.validatedChatPermissionMode(mode)
+            let terminal = try GlobalPool.validatedChatPermissionMode(mode, interactive: true)
+            check(headless == mode && terminal == mode, "explicit \(mode) survives both launch paths")
+        }
+        for mode in ["bypassPermissions", "dontAsk", "unknown", ""] {
+            do { _ = try GlobalPool.validatedChatPermissionMode(mode); check(false, "unsupported mode rejected") }
+            catch { check(true, "unsupported modes cannot silently replace requested Auto/Plan behavior") }
+        }
         // Native CCAM account selection and native StopFailure are both exercised.
         do {
             let fixture = try Fixture(mode: "limit"); defer { fixture.cleanup() }

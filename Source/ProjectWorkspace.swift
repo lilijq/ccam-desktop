@@ -61,6 +61,7 @@ final class ProjectWorkspace: NSView {
     var selectedSection: Section { current?.section ?? .terminal }
     var historyItems: [(id: String, title: String)] { current?.chatView?.historyItems ?? [] }
     var selectedConversationID: String? { current?.chatView?.selectedConversationID }
+    var selectedAccountName: String? { current?.chatView?.selectedAccountName }
     func runningCount(for projectID: UUID) -> Int { workspaces[projectID]?.chatView?.hasRunning == true ? 1 : 0 }
 
     init(terminal: TerminalWorkspace) {
@@ -130,6 +131,8 @@ final class ProjectWorkspace: NSView {
         current.chat.selectConversation(id: id); current.section = .chat; displaySection()
     }
     func newConversation() { current?.section = .chat; displaySection(); current?.chat.newConversation() }
+    func showConversationActions(id: String, from sender: NSView) { current?.chat.showConversationActions(id: id, from: sender) }
+    func showDeletedConversations(from sender: NSView) { current?.chat.showDeletedConversations(from: sender) }
     func focusInput() { if selectedSection == .chat { current?.chat.focusInput() } }
     func stopAll() { workspaces.values.forEach { $0.chatView?.stop() } }
 }

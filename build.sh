@@ -21,7 +21,7 @@ fi
 clang -O2 -mmacosx-version-min=13.0 -c Source/PTYBridge.c -o "$BUILD/PTYBridge.o"
 swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" -module-cache-path "$BUILD" -framework AppKit \
   -I "$BUILD/SwiftTerm" -import-objc-header Source/PTYBridge.h "$BUILD/PTYBridge.o" "$BUILD/SwiftTerm/libSwiftTerm.a" \
-  Source/Theme.swift Source/Core.swift Source/ProjectStore.swift Source/BrowserLockStore.swift Source/BrowserRouting.swift Source/BrowserSettingsGuard.swift Source/BrowserLockWindow.swift Source/GlobalPool.swift Source/PoolCoordinator.swift Source/CommandCatalog.swift Source/UI.swift Source/OperationPresentation.swift Source/OperationWindow.swift Source/PTYSession.swift Source/TerminalCommandFilter.swift Source/TerminalWorkspace.swift Source/FeatureIndex.swift Source/CommandCenterView.swift Source/TaskComposer.swift Source/ChatStore.swift Source/ChatRuntime.swift Source/ProjectChatView.swift Source/ProjectFiles.swift Source/ProjectGit.swift Source/ProjectWorkspace.swift Source/WorkspaceSidebar.swift Source/App.swift Source/App+Projects.swift Source/main.swift \
+  Source/Theme.swift Source/NetworkEnvironment.swift Source/Core.swift Source/QuotaSummary.swift Source/ProjectStore.swift Source/BrowserLockStore.swift Source/BrowserRouting.swift Source/BrowserSettingsGuard.swift Source/BrowserLockWindow.swift Source/GlobalPool.swift Source/PoolCoordinator.swift Source/CommandCatalog.swift Source/UI.swift Source/OperationPresentation.swift Source/OperationWindow.swift Source/PTYSession.swift Source/TerminalCommandFilter.swift Source/TerminalWorkspace.swift Source/FeatureIndex.swift Source/CommandCenterView.swift Source/TaskComposer.swift Source/ChatAttachments.swift Source/AttachmentComposer.swift Source/ChatStore.swift Source/ChatRuntime.swift Source/ProjectChatView.swift Source/ProjectFiles.swift Source/ProjectGit.swift Source/ProjectWorkspace.swift Source/WorkspaceSidebar.swift Source/App.swift Source/App+Projects.swift Source/main.swift \
   -o "$APP/Contents/MacOS/CCAMDesktop"
 cp "$APP/Contents/MacOS/CCAMDesktop" "$APP/Contents/MacOS/CCAMBrowser"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -33,8 +33,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>CCAM Desktop</string>
 <key>CFBundleDisplayName</key><string>CCAM Desktop</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.1</string>
-<key>CFBundleVersion</key><string>10</string>
+<key>CFBundleShortVersionString</key><string>2.4.0</string>
+<key>CFBundleVersion</key><string>14</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>AppIcon</string>
@@ -47,6 +47,8 @@ codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 # Keep the signed archive free of metadata added by cloud-synced folders.
 ditto -c -k --norsrc --keepParent "$APP" "$PWD/CCAM Desktop.app.zip"
-ditto --norsrc "$APP" "$DEST"
-echo "Built: $DEST"
+if [[ "${CCAM_BUILD_COPY_APP:-1}" != "0" ]]; then
+  ditto --norsrc "$APP" "$DEST"
+  echo "Built: $DEST"
+fi
 echo "Signed archive: $PWD/CCAM Desktop.app.zip"

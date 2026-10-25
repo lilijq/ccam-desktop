@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let poolSummary = label("正在读取账号", size: 12, color: Theme.muted)
     private var workspaceSidebar: WorkspaceSidebar!
     private var compactManage: SidebarItemButton!
+    private let compactQuota = SidebarQuotaButton(compact: true)
     private var mainBottom: NSLayoutConstraint!
     private var managementPopover: NSPopover?
     private var compactShell = false
@@ -21,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var accountsError: String?
     var usageError: String?
     var refreshing = false
+    private var refreshAgain = false
     var lastRefresh: Date?
     var selected = 0
     var renderedPage = -1
@@ -98,8 +100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         main.addItem(view)
         NSApp.mainMenu = main
     }
-    @objc func refreshMenu() { refresh(); render() }
-    @objc func aboutApp() { let a = NSAlert(); a.messageText = "CCAM Desktop 2.1"; a.informativeText = "本地原生 macOS 工作台\n适配 CCAM 0.11.0\n第三方界面，与 CCAM / Anthropic 无隶属关系。"; a.beginSheetModal(for: window) }
+    @objc func refreshMenu() { refresh(forceUsage: true); render() }
+    @objc func aboutApp() { let a = NSAlert(); a.messageText = "CCAM Desktop " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""); a.informativeText = "本地原生 macOS 工作台\n适配 CCAM 0.11.0\n第三方界面，与 CCAM / Anthropic 无隶属关系。"; a.beginSheetModal(for: window) }
 
     @objc func desktopLayout() { window.setContentSize(NSSize(width: 1240, height: 820)); window.center(); updateWindowLayout() }
     @objc func compactLayout() { window.setContentSize(NSSize(width: 390, height: 800)); window.center(); updateWindowLayout() }
@@ -113,8 +115,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sidebarView.isHidden = shell
         mainLeading.constant = shell ? 16 : 24
         mainTrailing.constant = shell ? -16 : -24
-        mainBottom.constant = shell ? -50 : 0
+        mainBottom.constant = shell ? -82 : 0
         compactManage.isHidden = !shell
+        compactQuota.isHidden = !shell
         compactNavigation.isHidden = !shell
         compactShell = shell
         commandCenterHeight?.constant = max(380, (window.contentView?.bounds.height ?? 820) - 190)
@@ -159,11 +162,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc private func selectNavigation(_ item: NSMenuItem) { navigate(to: item.tag) }
     private func updatePoolSummary() {
-        let available = usage.filter { !$0.needsLogin && $0.error == nil && !$0.windows.isEmpty && $0.windows.allSatisfy { $0.used < 100 } }.count
+        let summary = QuotaSummary.make(accounts: accounts, usage: usage, preferredAccount: projectWorkspace.selectedAccountName)
         if refreshing && accounts.isEmpty { poolSummary.stringValue = "正在读取账号" }
-        else if accountsError != nil || usageError != nil { poolSummary.stringValue = "账号状态待刷新" }
+        else if accountsError != nil || usageError != nil { poolSummary.stringValue = "本地缓存读取失败" }
         else if accounts.isEmpty { poolSummary.stringValue = "添加账号后开始任务" }
-        else { poolSummary.stringValue = "\(accounts.count) 个账号，\(available) 个额度可用" }
+        else { poolSummary.stringValue = summary.detail }
+        workspaceSidebar?.updateQuota(summary, readFailed: accountsError != nil || usageError != nil)
+        compactQuota.update(summary, readFailed: accountsError != nil || usageError != nil)
     }
     func makeWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1240, height: 820), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
@@ -180,9 +185,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         workspaceSidebar.onConversation = { [weak self] id in
             guard let self else { return }; self.projectWorkspace.selectConversation(id: id); self.selected = 2; self.render()
         }
+        workspaceSidebar.onConversationActions = { [weak self] id, sender in self?.projectWorkspace.showConversationActions(id: id, from: sender) }
+        workspaceSidebar.onDeletedConversations = { [weak self] sender in self?.projectWorkspace.showDeletedConversations(from: sender) }
+        workspaceSidebar.onQuota = { [weak self] in self?.navigate(to: 1) }
         workspaceSidebar.onManage = { [weak self] sender in self?.showManagement(from: sender) }
         compactManage = SidebarItemButton("", symbol: "gearshape") { [weak self] in guard let self else { return }; self.showManagement(from: self.compactManage) }
         compactManage.setAccessibilityLabel("管理与设置"); compactManage.toolTip = "管理与设置"; compactManage.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(compactManage)
+        compactQuota.handler = { [weak self] in self?.navigate(to: 1) }
+        compactQuota.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(compactQuota)
         let main = NSView(); main.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(main)
         projectButton.actionBlock = { [weak self] in self?.projectPicker() }
         projectButton.isBordered = false; projectButton.font = Theme.font(size: 14, weight: .medium)
@@ -215,7 +225,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSLayoutConstraint.activate([
             side.leadingAnchor.constraint(equalTo: root.leadingAnchor), side.topAnchor.constraint(equalTo: root.topAnchor), side.bottomAnchor.constraint(equalTo: root.bottomAnchor), sidebarWidth,
             workspaceSidebar.leadingAnchor.constraint(equalTo: side.leadingAnchor), workspaceSidebar.widthAnchor.constraint(equalToConstant: 224), workspaceSidebar.topAnchor.constraint(equalTo: side.topAnchor), workspaceSidebar.bottomAnchor.constraint(equalTo: side.bottomAnchor),
-            compactManage.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16), compactManage.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10), compactManage.widthAnchor.constraint(equalToConstant: 36), compactManage.heightAnchor.constraint(equalToConstant: 36),
+            compactManage.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16), compactManage.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -24), compactManage.widthAnchor.constraint(equalToConstant: 36), compactManage.heightAnchor.constraint(equalToConstant: 36),
+            compactQuota.leadingAnchor.constraint(equalTo: compactManage.trailingAnchor, constant: 6), compactQuota.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16), compactQuota.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8), compactQuota.heightAnchor.constraint(equalToConstant: 64),
             mainLeading, mainTrailing, main.topAnchor.constraint(equalTo: root.topAnchor, constant: 36), mainBottom,
             top.topAnchor.constraint(equalTo: main.topAnchor), top.leadingAnchor.constraint(equalTo: main.leadingAnchor), top.trailingAnchor.constraint(equalTo: main.trailingAnchor), top.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
             scroll.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 14), scroll.leadingAnchor.constraint(equalTo: main.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: main.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: main.bottomAnchor),
@@ -229,6 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         workspaceSidebar?.update(records: projectStore?.activeProjects ?? [], currentID: currentProject?.id,
                                  items: projectWorkspace.historyItems, selectedID: projectWorkspace.selectedConversationID,
                                  running: currentProject.map { projectWorkspace.runningCount(for: $0.id) > 0 } ?? false)
+        updatePoolSummary()
     }
     private func newSidebarConversation() {
         guard let project = currentProject else { chooseProject(); return }
@@ -246,8 +258,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let stack = column([], spacing: 3)
         let status = label(poolSummary.stringValue, size: 11, color: Theme.muted)
         status.maximumNumberOfLines = 1; status.lineBreakMode = .byTruncatingTail; status.toolTip = status.stringValue
-        let refresh = SidebarItemButton("", symbol: "arrow.clockwise") { [weak self] in self?.managementPopover?.close(); self?.refresh() }
-        refresh.setAccessibilityLabel("刷新额度"); refresh.toolTip = "刷新额度"; refresh.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        let refresh = SidebarItemButton("", symbol: "arrow.clockwise") { [weak self] in self?.managementPopover?.close(); self?.refresh(forceUsage: true) }
+        refresh.setAccessibilityLabel("刷新缓存"); refresh.toolTip = "仅重读本机额度缓存，不连接 Claude"; refresh.widthAnchor.constraint(equalToConstant: 32).isActive = true
         fillWidth(row([status, spacer(), refresh], spacing: 4), in: stack)
         func item(_ title: String, _ symbol: String, _ action: @escaping () -> Void) {
             let button = SidebarItemButton(title, symbol: symbol) { [weak self] in self?.managementPopover?.close(); action() }
@@ -270,8 +282,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         popover.contentSize = NSSize(width: 256, height: 330)
         popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .maxY)
     }
-    func refresh() {
-        guard !refreshing else { return }; refreshing = true; updatePoolSummary()
+    func refresh(forceUsage: Bool = false) {
+        guard !refreshing else { refreshAgain = refreshAgain || forceUsage; return }; refreshing = true; updatePoolSummary()
         let group = DispatchGroup()
         group.enter(); CCAMClient.read(["list", "--json"], directory: FileManager.default.homeDirectoryForCurrentUser.path) { [weak self] result in
             defer { group.leave() }; guard let self else { return }
@@ -281,7 +293,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.terminalWorkspace.accountNames = self.accounts.map { $0.name }
             } catch { self.accountsError = error.localizedDescription }
         }
-        group.enter(); CCAMClient.read(["usage", "--json"], directory: FileManager.default.homeDirectoryForCurrentUser.path) { [weak self] result in
+        // Keep startup, activation, timers, login completion and manual refresh
+        // offline. The user can view stored limits without probing Claude.
+        group.enter(); CCAMClient.read(["usage", "--json", "--source", "cache"], directory: FileManager.default.homeDirectoryForCurrentUser.path) { [weak self] result in
             defer { group.leave() }; guard let self else { return }
             do {
                 guard result.succeeded else { throw AppError.message(result.output) }
@@ -292,6 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }; self.refreshing = false; self.lastRefresh = Date()
             self.updatePoolSummary()
             if self.selected == 0 || self.selected == 1 { self.render() }
+            if self.refreshAgain { self.refreshAgain = false; self.refresh(forceUsage: true) }
         }
         if selected == 0 || selected == 1 { render() }
     }
@@ -337,9 +352,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !subtitle.isEmpty { fillWidth(label(subtitle, size: 12, color: Theme.muted), in: content) }
     }
     func dashboard() {
-        header("账号与额度", "", action: ClosureButton("添加账号", symbol: "plus") { [weak self] in self?.addAccount() })
+        let reload = ClosureButton(refreshing ? "读取中…" : "刷新缓存", symbol: "arrow.clockwise") { [weak self] in self?.refresh(forceUsage: true) }
+        reload.isEnabled = !refreshing
+        reload.toolTip = "仅重读本机额度缓存，不连接 Claude"
+        header("账号与额度", "", action: row([reload, ClosureButton("添加账号", symbol: "plus") { [weak self] in self?.addAccount() }]))
         let known = usage.filter { !$0.windows.isEmpty && !$0.needsLogin && $0.error == nil }.count
-        fillWidth(adaptiveRow([label("\(known) 个账号已读取额度", size: 12, color: Theme.muted), spacer(), ClosureButton("Chrome 账号锁", symbol: "lock") { [weak self] in self?.showBrowserLocks() }]), in: content)
+        fillWidth(adaptiveRow([label("\(known) 个账号有缓存 · 联网查询已暂停", size: 12, color: Theme.muted), spacer(), ClosureButton("Chrome 账号锁", symbol: "lock") { [weak self] in self?.showBrowserLocks() }]), in: content)
         if let error = accountsError ?? usageError { fillWidth(Card(label("读取提示：" + OperationPresentation.clean(error), size: 12, color: Theme.warning)), in: content) }
         if accounts.isEmpty { fillWidth(Card(column([label(refreshing ? "正在读取账号…" : "还没有账号", size: 20), label("添加或导入账号", color: Theme.muted)])), in: content) }
         for account in accounts { fillWidth(accountCard(account), in: content) }
@@ -369,7 +387,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             else { missing = "暂无额度数据" }
             fillWidth(label(missing, size: 12, color: Theme.muted), in: text)
         }
-        if let error = info?.error { fillWidth(label(OperationPresentation.clean(error), size: 11, color: Theme.warning), in: text) }
+        if let error = info?.errorSummary {
+            let message = label(error, size: 11, color: Theme.warning)
+            message.toolTip = info?.error.map(OperationPresentation.clean)
+            fillWidth(message, in: text)
+        }
         let actions = adaptiveRow([], spacing: 8, breakpoint: 440)
         actions.addArrangedSubview(ClosureButton("登录", symbol: "person.crop.circle.badge.checkmark") { [weak self] in guard let self else { return }; self.run(["login", account.name], directory: self.stableDirectory, title: "登录 " + account.name, detail: "在浏览器完成账号登录。") })
         let binding = try? BrowserLockStore().binding(account: account.name)
@@ -457,7 +479,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 UserDefaults.standard.set(path, forKey: "ccamPath"); self.render(); self.refresh()
             }
         }]), location], spacing: 8))
-        let toggle = NSButton(checkboxWithTitle: "每分钟刷新额度", target: self, action: #selector(toggleRefresh(_:)))
+        let toggle = NSButton(checkboxWithTitle: "每分钟更新本地额度缓存", target: self, action: #selector(toggleRefresh(_:)))
+        toggle.toolTip = "仅读取本机已有记录，不连接 Claude"
         toggle.state = UserDefaults.standard.object(forKey: "autoRefresh") as? Bool == false ? .off : .on
         addSetting(toggle)
         addSetting(row([label("本地数据", size: 14), spacer(), ClosureButton("详情") { [weak self] in
@@ -555,7 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     catch { showError("登录锁更新失败：" + error.localizedDescription, window: self?.window) }
                 }
             }
-            self?.refresh()
+            self?.refresh(forceUsage: succeeded && ["login", "add"].contains(args.first ?? ""))
         }
         operationWindows.append(operation)
         operation.showWindow(nil)
